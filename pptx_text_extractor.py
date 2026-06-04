@@ -801,6 +801,9 @@ class PDFConvertTab(BaseTabFrame):
         self._start_run(self._thread, targets)
 
     def _thread(self, target_indices):
+        # COM 은 스레드별로 초기화 필요 (메인 스레드와 별개)
+        import pythoncom
+        pythoncom.CoInitialize()
         items       = self._file_list.items
         total_files = len(target_indices)
         dpi         = self._dpi_var.get()
@@ -824,6 +827,9 @@ class PDFConvertTab(BaseTabFrame):
                     self._queue.put(("error", idx, str(e)[:60]))
         except Exception as e:
             self._queue.put(("error", 0, f"Thread error: {e}"))
+        finally:
+            import pythoncom
+            pythoncom.CoUninitialize()
         self._queue.put(("all_done", total_files))
 
 
