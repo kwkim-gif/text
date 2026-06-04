@@ -7,6 +7,23 @@ echo   PPTX Text Extractor  ^|  EXE Build Script
 echo =====================================================
 echo.
 
+set SCRIPT_NAME=pptx_text_extractor.py
+set SCRIPT_URL=https://raw.githubusercontent.com/kwkim-gif/text/claude/keen-davinci-QBEal/pptx_text_extractor.py
+set SCRIPT_DEST=%~dp0%SCRIPT_NAME%
+
+if not exist "%SCRIPT_DEST%" (
+    echo [WARN] %SCRIPT_NAME% not found. Downloading from GitHub...
+    powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient).DownloadFile('%SCRIPT_URL%','%SCRIPT_DEST%')"
+    if not exist "%SCRIPT_DEST%" (
+        echo [ERROR] Failed to download %SCRIPT_NAME%.
+        echo         Please place %SCRIPT_NAME% in the same folder as build.bat.
+        pause
+        exit /b 1
+    )
+    echo [OK] %SCRIPT_NAME% downloaded.
+    echo.
+)
+
 python --version > nul 2>&1
 if errorlevel 1 goto NO_PYTHON
 goto HAS_PYTHON
@@ -73,7 +90,7 @@ echo.
 
 echo [3/3] Building EXE (may take 1-2 minutes)...
 echo.
-python -m PyInstaller --onefile --windowed --name "PPTX_TextExtractor" pptx_text_extractor.py
+python -m PyInstaller --onefile --windowed --name "PPTX_TextExtractor" "%SCRIPT_DEST%"
 
 if errorlevel 1 (
     echo.
