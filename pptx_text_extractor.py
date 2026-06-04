@@ -496,7 +496,7 @@ class BaseTabFrame(tk.Frame):
 
         tk.Frame(inner, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-        self._file_list = FileListWidget(inner, height=180)
+        self._file_list = FileListWidget(inner, height=120)
         self._file_list.pack(fill="both", expand=True)
 
         if DND_AVAILABLE:
@@ -885,8 +885,8 @@ class PPTXUtilityApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PPTX Utility")
-        self.geometry("780x700")
-        self.minsize(660, 580)
+        self.geometry("780x860")
+        self.minsize(660, 760)
         self.configure(bg=COLOR_BG)
         self.resizable(True, True)
         try:
