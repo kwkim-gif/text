@@ -588,50 +588,58 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             target=self._run_all_thread, args=(targets,), daemon=True)
         thread.start()
 
-    def _run_all_thread(self, target_indices: list[int]):
+    # ── 메인 스레드 전용 UI 업데이트 헬퍼 (after()에서 직접 호출) ──────
+    # after(ms, func, arg1, arg2, ...) 형식만 안전 → 람다/kwargs 금지
+
+    def _ui_set_running(self, idx, job_num, total_files, name):
+        self._file_list.update_item(idx, status=ST_RUNNING, message="")
+        self._lbl_status.configure(
+            text=f"[{job_num}/{total_files}]  {name}", fg=COLOR_ACCENT)
+
+    def _ui_set_done(self, idx, total_slides, out_path):
+        self._file_list.update_item(
+            idx, status=ST_DONE, slides=str(total_slides),
+            message="저장 완료", output=out_path)
+
+    def _ui_set_error(self, idx, msg):
+        self._file_list.update_item(idx, status=ST_ERROR, message=msg)
+
+    def _ui_progress(self, pct, cur_slide, total_slides, job_num, total_files):
+        self._progressbar["value"] = pct
+        self._lbl_progress_text.configure(
+            text=f"파일 {job_num}/{total_files}  |  Slide {cur_slide}/{total_slides}  ({pct}%)")
+
+    # ── 백그라운드 추출 스레드 ────────────────────────────────────────
+
+    def _run_all_thread(self, target_indices):
         items = self._file_list.items
         total_files = len(target_indices)
 
         for job_num, idx in enumerate(target_indices, start=1):
             item = items[idx]
 
-            # after()는 **kwargs 미지원 → lambda 래핑으로 메인 스레드에 전달
-            self.after(0, lambda i=idx: self._file_list.update_item(
-                i, status=ST_RUNNING, message=""))
-            self.after(0, lambda jn=job_num, tf=total_files, nm=item.name:
-                       self._lbl_status.configure(
-                           text=f"[{jn}/{tf}]  {nm}", fg=COLOR_ACCENT))
+            self.after(0, self._ui_set_running, idx, job_num, total_files, item.name)
 
-            def make_slide_cb(file_job, total_f):
+            def make_progress_cb(jn, tf):
                 def cb(cur, total_slides):
-                    pct_total = int(((file_job - 1) + cur / total_slides) / total_f * 100)
-                    self.after(0, lambda p=pct_total, c=cur, ts=total_slides,
-                               fj=file_job, tf=total_f:
-                               self._update_progress(p, c, ts, fj, tf))
+                    pct = int(((jn - 1) + cur / total_slides) / tf * 100)
+                    self.after(0, self._ui_progress, pct, cur, total_slides, jn, tf)
                 return cb
 
             try:
                 out, total_slides, empty = extract_pptx_to_txt(
                     item.path,
-                    progress_callback=make_slide_cb(job_num, total_files),
+                    progress_callback=make_progress_cb(job_num, total_files),
                 )
                 self._last_output_folder = os.path.dirname(out)
-                self.after(0, lambda i=idx, ts=total_slides, o=out:
-                           self._file_list.update_item(
-                               i, status=ST_DONE, slides=str(ts),
-                               message="저장 완료", output=o))
+                self.after(0, self._ui_set_done, idx, total_slides, out)
             except Exception as e:
-                self.after(0, lambda i=idx, msg=str(e)[:40]:
-                           self._file_list.update_item(
-                               i, status=ST_ERROR, message=msg))
+                self.after(0, self._ui_set_error, idx, str(e)[:50])
 
         self.after(0, self._on_all_done, total_files)
 
     def _update_progress(self, pct, cur_slide, total_slides, job_num, total_files):
-        self._progressbar["value"] = pct
-        self._lbl_progress_text.configure(
-            text=f"파일 {job_num}/{total_files}  |  Slide {cur_slide}/{total_slides}  ({pct}%)"
-        )
+        self._ui_progress(pct, cur_slide, total_slides, job_num, total_files)
 
     def _on_all_done(self, total_files):
         self._is_running = False
