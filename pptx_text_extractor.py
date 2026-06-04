@@ -113,46 +113,46 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     """
     win32com 으로 PowerPoint 를 제어해 슬라이드를 PNG 로 내보낸 뒤
     Pillow 로 PDF 로 병합.  실행 PC 에 PowerPoint 가 설치되어야 함.
-
-    [주의 사항]
-    - 기존에 실행 중인 PowerPoint 인스턴스가 있으면 재사용하고 종료하지 않음.
-    - Export 는 Visible=True 상태에서만 안정적으로 동작 (최소화 처리).
-    - 이미지 임시 폴더는 ASCII 경로를 사용해 COM 경로 오류를 방지.
     """
     import win32com.client
     from PIL import Image
 
     base     = os.path.splitext(os.path.basename(pptx_path))[0]
     out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
-    abs_path = os.path.abspath(pptx_path)
 
-    # 임시 폴더는 ASCII 경로(%TEMP%)에 생성 → COM Export 경로 오류 방지
-    temp_dir = tempfile.mkdtemp(prefix="pptxpdf_")
+    # 임시 폴더 (이미지 저장 + ASCII 경로 PPTX 복사본)
+    temp_dir  = tempfile.mkdtemp(prefix="pptxpdf_")
+    # 한글 파일명 → COM 경로 오류 방지: ASCII 이름으로 복사
+    temp_pptx = os.path.join(temp_dir, "input.pptx")
+    shutil.copy2(pptx_path, temp_pptx)
 
     ppt_app     = None
-    created_new = False   # 우리가 직접 생성한 인스턴스인지 여부
+    created_new = False
     prs         = None
 
     try:
-        # 기존에 실행 중인 PowerPoint 인스턴스 재사용 시도
+        # 기존에 실행 중인 PowerPoint 인스턴스가 있으면 재사용
+        # → 기존 창을 Quit() 으로 닫지 않기 위함
         try:
             ppt_app = win32com.client.GetActiveObject("PowerPoint.Application")
         except Exception:
             ppt_app     = win32com.client.Dispatch("PowerPoint.Application")
             created_new = True
 
-        # Export 는 Visible=True 에서만 안정적으로 동작
-        # (최소화 상태로 띄워서 화면에 방해되지 않게)
+        # Export 는 반드시 Visible=True 상태에서 동작
         ppt_app.Visible = True
+
+        # WithWindow=True 로 열어야 Export 가 안정적으로 작동
+        prs = ppt_app.Presentations.Open(
+            temp_pptx, ReadOnly=True, Untitled=False, WithWindow=True)
+
+        # 열린 창을 바로 최소화 (화면 방해 최소화)
         try:
-            ppt_app.WindowState = 2   # ppWindowMinimized = 2
+            prs.Windows(1).WindowState = 2   # ppWindowMinimized = 2
         except Exception:
             pass
 
-        prs  = ppt_app.Presentations.Open(
-            abs_path, ReadOnly=True, Untitled=False, WithWindow=False)
-
-        # 슬라이드 크기(포인트) → 픽셀 변환 (1pt = 1/72 inch)
+        # 슬라이드 크기(포인트) → 픽셀 (1pt = 1/72 inch)
         w_px = int(prs.PageSetup.SlideWidth  / 72 * dpi)
         h_px = int(prs.PageSetup.SlideHeight / 72 * dpi)
 
@@ -162,7 +162,6 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
         for i in range(1, total + 1):
             if progress_callback:
                 progress_callback(i, total)
-            # 이미지 경로는 반드시 절대 경로 + ASCII 파일명
             img_file = os.path.join(temp_dir, f"slide_{i:04d}.png")
             prs.Slides(i).Export(img_file, "PNG", w_px, h_px)
             img_paths.append(img_file)
@@ -170,7 +169,7 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
         prs.Close()
         prs = None
 
-        # Pillow 로 이미지 → PDF 병합
+        # 이미지 → PDF 병합
         images = [Image.open(p).convert("RGB") for p in img_paths]
         if images:
             images[0].save(
@@ -182,22 +181,19 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
             img.close()
 
     finally:
-        # 열었던 프레젠테이션이 아직 열려 있으면 닫기
         try:
             if prs is not None:
                 prs.Close()
         except Exception:
             pass
 
-        # 우리가 직접 생성한 인스턴스만 종료
-        # (기존 실행 중이던 PowerPoint 는 절대 종료하지 않음)
+        # 직접 생성한 인스턴스만 종료 (기존 사용자 PPT 창은 유지)
         try:
             if created_new and ppt_app:
                 ppt_app.Quit()
         except Exception:
             pass
 
-        # 임시 이미지 파일 삭제
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return out_path, total

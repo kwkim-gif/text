@@ -11,18 +11,15 @@ set SCRIPT_NAME=pptx_text_extractor.py
 set SCRIPT_URL=https://raw.githubusercontent.com/kwkim-gif/text/claude/keen-davinci-QBEal/pptx_text_extractor.py
 set SCRIPT_DEST=%~dp0%SCRIPT_NAME%
 
+echo Downloading latest %SCRIPT_NAME% from GitHub...
+powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient).DownloadFile('%SCRIPT_URL%','%SCRIPT_DEST%')"
 if not exist "%SCRIPT_DEST%" (
-    echo [WARN] %SCRIPT_NAME% not found. Downloading from GitHub...
-    powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient).DownloadFile('%SCRIPT_URL%','%SCRIPT_DEST%')"
-    if not exist "%SCRIPT_DEST%" (
-        echo [ERROR] Failed to download %SCRIPT_NAME%.
-        echo         Please place %SCRIPT_NAME% in the same folder as build.bat.
-        pause
-        exit /b 1
-    )
-    echo [OK] %SCRIPT_NAME% downloaded.
-    echo.
+    echo [ERROR] Failed to download %SCRIPT_NAME%.
+    pause
+    exit /b 1
 )
+echo [OK] %SCRIPT_NAME% ready.
+echo.
 
 python --version > nul 2>&1
 if errorlevel 1 goto NO_PYTHON
