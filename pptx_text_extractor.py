@@ -595,37 +595,35 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         for job_num, idx in enumerate(target_indices, start=1):
             item = items[idx]
 
-            # 상태: 추출 중
-            self.after(0, self._file_list.update_item, idx,
-                       **{"status": ST_RUNNING, "message": ""})
-            self.after(0, self._lbl_status.configure,
-                       {"text": f"[{job_num}/{total_files}]  {item.name}", "fg": COLOR_ACCENT})
+            # after()는 **kwargs 미지원 → lambda 래핑으로 메인 스레드에 전달
+            self.after(0, lambda i=idx: self._file_list.update_item(
+                i, status=ST_RUNNING, message=""))
+            self.after(0, lambda jn=job_num, tf=total_files, nm=item.name:
+                       self._lbl_status.configure(
+                           text=f"[{jn}/{tf}]  {nm}", fg=COLOR_ACCENT))
 
-            def make_slide_cb(file_idx, file_job, total_f):
+            def make_slide_cb(file_job, total_f):
                 def cb(cur, total_slides):
-                    pct_file  = cur / total_slides
-                    pct_total = ((file_job - 1) + pct_file) / total_f * 100
-                    self.after(0, self._update_progress,
-                               int(pct_total), cur, total_slides, file_job, total_f)
+                    pct_total = int(((file_job - 1) + cur / total_slides) / total_f * 100)
+                    self.after(0, lambda p=pct_total, c=cur, ts=total_slides,
+                               fj=file_job, tf=total_f:
+                               self._update_progress(p, c, ts, fj, tf))
                 return cb
 
             try:
                 out, total_slides, empty = extract_pptx_to_txt(
                     item.path,
-                    progress_callback=make_slide_cb(idx, job_num, total_files),
+                    progress_callback=make_slide_cb(job_num, total_files),
                 )
                 self._last_output_folder = os.path.dirname(out)
-                self.after(0, self._file_list.update_item, idx, **{
-                    "status":  ST_DONE,
-                    "slides":  str(total_slides),
-                    "message": f"저장 완료",
-                    "output":  out,
-                })
+                self.after(0, lambda i=idx, ts=total_slides, o=out:
+                           self._file_list.update_item(
+                               i, status=ST_DONE, slides=str(ts),
+                               message="저장 완료", output=o))
             except Exception as e:
-                self.after(0, self._file_list.update_item, idx, **{
-                    "status":  ST_ERROR,
-                    "message": str(e)[:30],
-                })
+                self.after(0, lambda i=idx, msg=str(e)[:40]:
+                           self._file_list.update_item(
+                               i, status=ST_ERROR, message=msg))
 
         self.after(0, self._on_all_done, total_files)
 
