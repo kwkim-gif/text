@@ -72,7 +72,7 @@ echo [OK] %PY_VER_STR% ready
 echo.
 
 echo [1/3] Installing packages...
-python -m pip install python-pptx pyinstaller --quiet --disable-pip-version-check
+python -m pip install python-pptx tkinterdnd2 pyinstaller --quiet --disable-pip-version-check
 if errorlevel 1 (
     echo [ERROR] Package installation failed.
     pause
@@ -90,7 +90,7 @@ echo.
 
 echo [3/3] Building EXE (may take 1-2 minutes)...
 echo.
-python -m PyInstaller --onefile --windowed --name "PPTX_TextExtractor" "%SCRIPT_DEST%"
+python -m PyInstaller --onefile --windowed --name "PPTX_TextExtractor" --collect-all tkinterdnd2 "%SCRIPT_DEST%"
 
 if errorlevel 1 (
     echo.
