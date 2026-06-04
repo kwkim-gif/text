@@ -159,11 +159,32 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
         total     = prs.Slides.Count
         img_paths = []
 
-        for i in range(1, total + 1):
+        # PNG 먼저 시도, 실패 시 JPG 로 재시도
+        # (PowerPoint 버전에 따라 PNG 필터가 없는 경우가 있음)
+        fmt, ext = "PNG", "png"
+        try:
+            test_file = os.path.join(temp_dir, "test.png")
+            prs.Slides(1).Export(test_file, "PNG", w_px, h_px)
+        except Exception:
+            fmt, ext = "JPG", "jpg"
+
+        # test_file 이 생성됐으면 슬라이드 1번으로 재사용
+        first_done = os.path.exists(os.path.join(temp_dir, "test.png"))
+        start_idx  = 1
+
+        if first_done:
+            renamed = os.path.join(temp_dir, f"slide_0001.{ext}")
+            os.rename(os.path.join(temp_dir, "test.png"), renamed)
+            img_paths.append(renamed)
+            if progress_callback:
+                progress_callback(1, total)
+            start_idx = 2
+
+        for i in range(start_idx, total + 1):
             if progress_callback:
                 progress_callback(i, total)
-            img_file = os.path.join(temp_dir, f"slide_{i:04d}.png")
-            prs.Slides(i).Export(img_file, "PNG", w_px, h_px)
+            img_file = os.path.join(temp_dir, f"slide_{i:04d}.{ext}")
+            prs.Slides(i).Export(img_file, fmt, w_px, h_px)
             img_paths.append(img_file)
 
         prs.Close()
