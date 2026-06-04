@@ -467,5 +467,15 @@ class PPTXExtractorApp(tk.Tk):
 # ── 진입점 ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # EXE(--windowed) 빌드 시 콘솔 창이 뜨는 것을 방지
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+        # 이미 콘솔이 없는 경우(windowed 빌드)에만 무시됨
+        try:
+            ctypes.windll.kernel32.FreeConsole()
+        except Exception:
+            pass
+
     app = PPTXExtractorApp()
     app.mainloop()
