@@ -170,9 +170,14 @@ try {{
 
 $ppt.Visible = $true
 try {{
-    $prs = $ppt.Presentations.Open('{temp_pptx}', $true, $false, $false)
-    # ppSaveAsPDF = 32  (ExportAsFixedFormat 보다 버전 호환성 높음)
-    $prs.SaveAs('{temp_pdf}', 32)
+    $prs = $ppt.Presentations.Open('{temp_pptx}', $false, $false, $true)
+    # ppSaveAsPDF = 32
+    try {{
+        $prs.SaveAs('{temp_pdf}', 32)
+    }} catch {{
+        Write-Error "SaveAs failed: $($_.Exception.Message)"
+        throw
+    }}
     $prs.Close()
 }} finally {{
     if ($createdNew) {{ $ppt.Quit() }}
@@ -190,8 +195,10 @@ try {{
         )
 
         if result.returncode != 0 or not os.path.exists(temp_pdf):
-            detail = (result.stderr or result.stdout or "no output").strip()
-            raise Exception(detail[:120])
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            detail = (stderr or stdout or "no output")
+            raise Exception(detail[:200])
 
         # ── Step 2: PDF 페이지 → 이미지 (텍스트 레이어 제거, 무손실 PNG)
         zoom  = dpi / 72
