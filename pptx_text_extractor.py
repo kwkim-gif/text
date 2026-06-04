@@ -134,15 +134,24 @@ def _make_ascii_tempdir():
     return tempfile.mkdtemp(prefix="pptxpdf_")
 
 
+def _write_error_log(pptx_path, content):
+    """에러 로그를 입력 파일 옆에 저장."""
+    base = os.path.splitext(pptx_path)[0]
+    log_path = f"{base}_변환오류.log"
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception:
+        pass
+    return log_path
+
+
 def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     """
-    PowerShell COM 으로 PPTX → 중간 PDF → 이미지 → 이미지 전용 PDF.
-
-    win32com 은 PyInstaller --onefile 환경에서 CoInitialize/등록 문제로
-    불안정. Windows 내장 PowerShell 로 COM 을 대신 호출해 우회.
+    PowerShell COM 으로 PPTX → 중간 PDF → PyMuPDF 래스터 → 이미지 전용 PDF.
+    Pillow PDF writer 는 JPEG 인코딩 오류를 일으키므로 PyMuPDF 로 교체.
     """
     import fitz
-    from PIL import Image as PILImage
 
     base     = os.path.splitext(os.path.basename(pptx_path))[0]
     out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
@@ -153,9 +162,7 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     shutil.copy2(pptx_path, temp_pptx)
 
     try:
-        # ── Step 1: PowerShell .ps1 파일로 COM 자동화
-        # -Command 인라인 방식은 따옴표 이스케이프 문제로 불안정 →
-        # .ps1 파일에 저장 후 -File 로 실행하는 방식이 안정적
+        # ── Step 1: PowerShell COM  PPTX → PDF
         ps_file = os.path.join(temp_dir, "convert.ps1")
         ps_content = f"""$ErrorActionPreference = 'Stop'
 
@@ -172,18 +179,12 @@ $ppt.Visible = $true
 try {{
     $prs = $ppt.Presentations.Open('{temp_pptx}', $false, $false, $true)
     # ppSaveAsPDF = 32
-    try {{
-        $prs.SaveAs('{temp_pdf}', 32)
-    }} catch {{
-        Write-Error "SaveAs failed: $($_.Exception.Message)"
-        throw
-    }}
+    $prs.SaveAs('{temp_pdf}', 32)
     $prs.Close()
 }} finally {{
     if ($createdNew) {{ $ppt.Quit() }}
 }}
 """
-        # UTF-8 BOM 포함 저장 (PowerShell이 한글 경로 읽을 때 필요)
         with open(ps_file, "w", encoding="utf-8-sig") as f:
             f.write(ps_content)
 
@@ -191,38 +192,48 @@ try {{
             ["powershell", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-File", ps_file],
             capture_output=True, text=True, timeout=300,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            creationflags=0x08000000,
         )
 
         if result.returncode != 0 or not os.path.exists(temp_pdf):
             stderr = (result.stderr or "").strip()
             stdout = (result.stdout or "").strip()
+            log_content = (
+                f"[PowerShell returncode] {result.returncode}\n"
+                f"[STDERR]\n{stderr}\n\n"
+                f"[STDOUT]\n{stdout}\n"
+            )
+            _write_error_log(pptx_path, log_content)
             detail = (stderr or stdout or "no output")
-            raise Exception(detail[:200])
+            raise Exception(detail[:300])
 
-        # ── Step 2: PDF 페이지 → 이미지 (텍스트 레이어 제거, 무손실 PNG)
-        zoom  = dpi / 72
-        doc   = fitz.open(temp_pdf)
-        total = len(doc)
-        img_paths = []
+        # ── Step 2 + 3: PDF → pixmap → 이미지 전용 PDF  (PyMuPDF 로 일괄 처리)
+        zoom     = dpi / 72
+        src_doc  = fitz.open(temp_pdf)
+        total    = len(src_doc)
+        out_doc  = fitz.open()
 
-        for i, page in enumerate(doc):
+        for i, page in enumerate(src_doc):
             if progress_callback:
                 progress_callback(i + 1, total)
             pix      = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            img_file = os.path.join(temp_dir, f"slide_{i+1:04d}.png")
-            pix.save(img_file)
-            img_paths.append(img_file)
-        doc.close()
+            img_page = out_doc.new_page(width=pix.width, height=pix.height)
+            img_page.insert_image(img_page.rect, pixmap=pix)
 
-        # ── Step 3: 이미지 → 이미지 전용 PDF
-        images = [PILImage.open(p).convert("RGB") for p in img_paths]
-        if images:
-            images[0].save(
-                out_path, save_all=True,
-                append_images=images[1:], resolution=dpi)
-        for img in images:
-            img.close()
+        src_doc.close()
+        out_doc.save(out_path, deflate=True)
+        out_doc.close()
+
+    except Exception as exc:
+        # Step 1 에서 이미 로그를 썼을 수도 있으나, Step 2/3 오류는 여기서 기록
+        log_content = (
+            f"[Exception]\n{exc}\n\n"
+            f"[Traceback]\n"
+        )
+        import traceback
+        log_content += traceback.format_exc()
+        _write_error_log(pptx_path, log_content)
+        raise
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -663,8 +674,12 @@ class BaseTabFrame(tk.Frame):
                 message="저장 완료", output=out)
 
         elif kind == "error":
-            _, idx, err = msg
-            self._file_list.update_item(idx, status=ST_ERROR, message=err)
+            _, idx, err, log_path = msg
+            display = err[:80] + ("…" if len(err) > 80 else "")
+            if log_path:
+                display += f"  [로그: {log_path}]"
+            self._file_list.update_item(idx, status=ST_ERROR, message=display)
+            self._show_error_detail(err, log_path)
 
         elif kind == "all_done":
             _, tf = msg
@@ -672,6 +687,35 @@ class BaseTabFrame(tk.Frame):
             return True
 
         return False
+
+    def _show_error_detail(self, err_msg, log_path):
+        """에러 상세 팝업 (스크롤 가능)."""
+        import tkinter.scrolledtext as scrolledtext
+        win = tk.Toplevel(self)
+        win.title("변환 오류 상세")
+        win.geometry("700x400")
+        win.resizable(True, True)
+
+        st = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 9))
+        st.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        body = err_msg
+        if log_path and os.path.exists(log_path):
+            try:
+                with open(log_path, encoding="utf-8") as f:
+                    body = f.read()
+            except Exception:
+                pass
+        st.insert(tk.END, body)
+        st.configure(state="disabled")
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        if log_path:
+            tk.Label(btn_frame, text=f"로그 파일: {log_path}",
+                     font=("Malgun Gothic", 8), fg="#555").pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="닫기", command=win.destroy,
+                  width=10).pack(side=tk.RIGHT)
 
     def _finish(self, total_files):
         self._is_running = False
@@ -742,9 +786,9 @@ class TextExtractTab(BaseTabFrame):
                         item.path, progress_callback=make_cb(jn, total_files))
                     self._queue.put(("done", idx, slides, out))
                 except Exception as e:
-                    self._queue.put(("error", idx, str(e)[:60]))
+                    self._queue.put(("error", idx, str(e), None))
         except Exception as e:
-            self._queue.put(("error", 0, f"Thread error: {e}"))
+            self._queue.put(("error", 0, f"Thread error: {e}", None))
         self._queue.put(("all_done", total_files))
 
 
@@ -824,9 +868,13 @@ class PDFConvertTab(BaseTabFrame):
                         progress_callback=make_cb(jn, total_files))
                     self._queue.put(("done", idx, slides, out))
                 except Exception as e:
-                    self._queue.put(("error", idx, str(e)[:60]))
+                    base = os.path.splitext(item.path)[0]
+                    log_path = f"{base}_변환오류.log"
+                    if not os.path.exists(log_path):
+                        log_path = None
+                    self._queue.put(("error", idx, str(e), log_path))
         except Exception as e:
-            self._queue.put(("error", 0, f"Thread error: {e}"))
+            self._queue.put(("error", 0, f"Thread error: {e}", None))
         self._queue.put(("all_done", total_files))
 
 
