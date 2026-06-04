@@ -72,7 +72,7 @@ echo [OK] %PY_VER_STR% ready
 echo.
 
 echo [1/3] Installing packages...
-python -m pip install python-pptx tkinterdnd2 pyinstaller --quiet --disable-pip-version-check
+python -m pip install python-pptx tkinterdnd2 pywin32 Pillow pyinstaller --quiet --disable-pip-version-check
 if errorlevel 1 (
     echo [ERROR] Package installation failed.
     pause
@@ -84,13 +84,13 @@ echo.
 echo [2/3] Cleaning previous build...
 if exist "dist"  rmdir /s /q "dist"
 if exist "build" rmdir /s /q "build"
-if exist "PPTX_TextExtractor.spec" del /q "PPTX_TextExtractor.spec"
+if exist "PPTX_Utility.spec" del /q "PPTX_Utility.spec"
 echo       Done
 echo.
 
 echo [3/3] Building EXE (may take 1-2 minutes)...
 echo.
-python -m PyInstaller --onefile --windowed --name "PPTX_TextExtractor" --collect-all tkinterdnd2 "%SCRIPT_DEST%"
+python -m PyInstaller --onefile --windowed --name "PPTX_Utility" --collect-all tkinterdnd2 --collect-all win32com "%SCRIPT_DEST%"
 
 if errorlevel 1 (
     echo.
@@ -102,7 +102,7 @@ if errorlevel 1 (
 echo.
 echo =====================================================
 echo   Build complete!
-echo   Output: dist\PPTX_TextExtractor.exe
+echo   Output: dist\PPTX_Utility.exe
 echo =====================================================
 echo.
 explorer dist

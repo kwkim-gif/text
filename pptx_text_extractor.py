@@ -1,13 +1,15 @@
 # ============================================================
-# PPTX 텍스트 추출기 - 오탈자 검토용 GUI 프로그램 (Windows 11)
+# PPTX Utility - 텍스트 추출 + 보안 PDF 변환 (Windows 11 GUI)
 # ============================================================
-# pip install python-pptx tkinterdnd2
+# pip install python-pptx tkinterdnd2 pywin32 Pillow
 # ============================================================
 
 import os
 import sys
 import queue
 import threading
+import tempfile
+import shutil
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
@@ -27,7 +29,6 @@ COLOR_BG        = "#F3F3F3"
 COLOR_CARD      = "#FFFFFF"
 COLOR_ACCENT    = "#0067C0"
 COLOR_ACCENT_H  = "#005BA4"
-COLOR_ACCENT_DIM= "#CCE0F5"
 COLOR_BORDER    = "#E0E0E0"
 COLOR_TEXT      = "#1A1A1A"
 COLOR_SUBTEXT   = "#6B6B6B"
@@ -41,23 +42,24 @@ COLOR_ROW_EVEN  = "#F7F9FC"
 COLOR_ROW_DONE  = "#EAF5EE"
 COLOR_ROW_ERR   = "#FDF0EE"
 COLOR_ROW_SEL   = "#D6E8FB"
+COLOR_TAB_ACT   = "#1A1A1A"   # 활성 탭 배경
+COLOR_TAB_INACT = "#F3F3F3"   # 비활성 탭 배경
 
-# 각 파일의 상태값
-ST_WAITING  = "대기 중"
-ST_RUNNING  = "추출 중..."
-ST_DONE     = "완료"
-ST_ERROR    = "오류"
+ST_WAITING = "대기 중"
+ST_RUNNING = "처리 중..."
+ST_DONE    = "완료"
+ST_ERROR   = "오류"
 
 
 # ── 텍스트 추출 로직 ─────────────────────────────────────────
 
-def extract_text_from_shape(shape):
+def _extract_shape_text(shape):
     lines = []
     if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
         for row in shape.table.rows:
-            row_texts = [c.text.strip() for c in row.cells if c.text.strip()]
-            if row_texts:
-                lines.append("\t".join(row_texts))
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                lines.append("\t".join(cells))
     elif shape.has_text_frame:
         for para in shape.text_frame.paragraphs:
             text = "".join(r.text for r in para.runs).strip()
@@ -66,49 +68,113 @@ def extract_text_from_shape(shape):
     return lines
 
 
-def extract_text_from_slide(slide):
+def _extract_slide_text(slide):
     all_lines = []
     def process(shapes):
         for shape in shapes:
             if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
                 process(shape.shapes)
             else:
-                all_lines.extend(extract_text_from_shape(shape))
+                all_lines.extend(_extract_shape_text(shape))
     process(slide.shapes)
     return all_lines
 
 
 def extract_pptx_to_txt(pptx_path, progress_callback=None):
-    base_name  = os.path.splitext(os.path.basename(pptx_path))[0]
-    output_dir = os.path.dirname(pptx_path)
-    output_path = os.path.join(output_dir, f"{base_name}_오탈자검토.txt")
-
-    prs = Presentation(pptx_path)
-    total = len(prs.slides)
-    empty_count = 0
-    output_lines = []
+    base      = os.path.splitext(os.path.basename(pptx_path))[0]
+    out_path  = os.path.join(os.path.dirname(pptx_path), f"{base}_오탈자검토.txt")
+    prs       = Presentation(pptx_path)
+    total     = len(prs.slides)
+    empty_cnt = 0
+    lines     = []
 
     for idx, slide in enumerate(prs.slides, start=1):
         if progress_callback:
             progress_callback(idx, total)
-        output_lines.append("=========================================")
-        output_lines.append(f"[Slide {idx}]")
-        output_lines.append("=========================================")
-        texts = extract_text_from_slide(slide)
+        lines += ["=========================================",
+                  f"[Slide {idx}]",
+                  "========================================="]
+        texts = _extract_slide_text(slide)
         if texts:
-            output_lines.extend(texts)
+            lines.extend(texts)
         else:
-            output_lines.append(f"[Slide {idx}] 추출된 텍스트가 없습니다.")
-            empty_count += 1
-        output_lines.append("")
+            lines.append(f"[Slide {idx}] 추출된 텍스트가 없습니다.")
+            empty_cnt += 1
+        lines.append("")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(output_lines))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path, total, empty_cnt
 
-    return output_path, total, empty_count
+
+# ── PPTX → 이미지 → PDF 변환 로직 ───────────────────────────
+
+def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
+    """
+    win32com 으로 PowerPoint 를 제어해 슬라이드를 PNG 로 내보낸 뒤
+    Pillow 로 PDF 로 병합.  실행 PC 에 PowerPoint 가 설치되어야 함.
+    """
+    import win32com.client
+    from PIL import Image
+
+    base     = os.path.splitext(os.path.basename(pptx_path))[0]
+    out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
+    abs_path = os.path.abspath(pptx_path)
+
+    temp_dir = tempfile.mkdtemp(prefix="pptx_pdf_")
+    ppt_app  = None
+
+    try:
+        # PowerPoint 백그라운드 실행
+        ppt_app = win32com.client.Dispatch("PowerPoint.Application")
+        ppt_app.Visible = False
+
+        prs = ppt_app.Presentations.Open(
+            abs_path, ReadOnly=True, Untitled=False, WithWindow=False)
+
+        # 슬라이드 크기(포인트) → 픽셀 변환 (1pt = 1/72 inch)
+        w_pt = prs.PageSetup.SlideWidth
+        h_pt = prs.PageSetup.SlideHeight
+        w_px = int(w_pt / 72 * dpi)
+        h_px = int(h_pt / 72 * dpi)
+
+        total      = prs.Slides.Count
+        img_paths  = []
+
+        for i in range(1, total + 1):
+            if progress_callback:
+                progress_callback(i, total)
+            img_file = os.path.join(temp_dir, f"slide_{i:04d}.png")
+            prs.Slides(i).Export(img_file, "PNG", w_px, h_px)
+            img_paths.append(img_file)
+
+        prs.Close()
+
+        # Pillow 로 이미지 → PDF 병합
+        images = [Image.open(p).convert("RGB") for p in img_paths]
+        if images:
+            images[0].save(
+                out_path, save_all=True,
+                append_images=images[1:],
+                resolution=dpi,
+            )
+        for img in images:
+            img.close()
+
+    finally:
+        # PowerPoint 종료 보장
+        try:
+            if ppt_app:
+                ppt_app.Quit()
+        except Exception:
+            pass
+        # 임시 이미지 파일 삭제
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return out_path, total
 
 
-# ── 파일 항목 데이터 클래스 ──────────────────────────────────
+# ── 공용: 파일 항목 데이터 ───────────────────────────────────
 
 class FileItem:
     def __init__(self, path):
@@ -120,148 +186,113 @@ class FileItem:
         self.output  = ""
 
 
-# ── 파일 목록 테이블 위젯 ─────────────────────────────────────
+# ── 공용: 파일 목록 테이블 위젯 ──────────────────────────────
 
 class FileListWidget(tk.Frame):
     COLS = [
-        ("번호",   40,  "center"),
-        ("파일명", 280, "w"),
-        ("슬라이드", 70, "center"),
-        ("상태",   90,  "center"),
-        ("결과",   120, "w"),
+        ("번호",    40,  "center"),
+        ("파일명",  270, "w"),
+        ("슬라이드", 70,  "center"),
+        ("상태",    90,  "center"),
+        ("결과",    130, "w"),
     ]
 
-    def __init__(self, parent, on_select=None, **kwargs):
-        super().__init__(parent, bg=COLOR_CARD, **kwargs)
+    def __init__(self, parent, on_select=None, **kw):
+        super().__init__(parent, bg=COLOR_CARD, **kw)
         self._on_select = on_select
         self._items: list[FileItem] = []
         self._selected_idx = -1
         self._build()
 
     def _build(self):
-        # 헤더
-        header = tk.Frame(self, bg=COLOR_ACCENT)
-        header.pack(fill="x")
-        for col_name, width, anchor in self.COLS:
-            tk.Label(
-                header, text=col_name,
-                bg=COLOR_ACCENT, fg="white",
-                font=("Segoe UI", 9, "bold"),
-                width=width // 7, anchor=anchor,
-                padx=6, pady=6,
-            ).pack(side="left")
+        hdr = tk.Frame(self, bg=COLOR_ACCENT)
+        hdr.pack(fill="x")
+        for name, width, anchor in self.COLS:
+            tk.Label(hdr, text=name, bg=COLOR_ACCENT, fg="white",
+                     font=("Segoe UI", 9, "bold"),
+                     width=width // 7, anchor=anchor,
+                     padx=6, pady=6).pack(side="left")
 
-        # 스크롤 가능 목록
-        scroll_frame = tk.Frame(self, bg=COLOR_CARD)
-        scroll_frame.pack(fill="both", expand=True)
+        wrap = tk.Frame(self, bg=COLOR_CARD)
+        wrap.pack(fill="both", expand=True)
 
-        self._canvas = tk.Canvas(scroll_frame, bg=COLOR_CARD,
+        self._canvas = tk.Canvas(wrap, bg=COLOR_CARD,
                                  highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical",
-                                  command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
+        sb = ttk.Scrollbar(wrap, orient="vertical",
+                           command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
 
-        self._list_frame = tk.Frame(self._canvas, bg=COLOR_CARD)
-        self._canvas_window = self._canvas.create_window(
-            (0, 0), window=self._list_frame, anchor="nw"
-        )
-        self._list_frame.bind("<Configure>", self._on_frame_configure)
-        self._canvas.bind("<Configure>", self._on_canvas_configure)
-
-        # 마우스 휠 스크롤
+        self._lf = tk.Frame(self._canvas, bg=COLOR_CARD)
+        self._win = self._canvas.create_window((0, 0), window=self._lf, anchor="nw")
+        self._lf.bind("<Configure>",
+                      lambda e: self._canvas.configure(
+                          scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(self._win, width=e.width))
         self._canvas.bind("<MouseWheel>",
-                          lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
-
-        self._row_frames = []
+                          lambda e: self._canvas.yview_scroll(
+                              -1 * (e.delta // 120), "units"))
         self._render_empty()
 
-    def _on_frame_configure(self, e):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-    def _on_canvas_configure(self, e):
-        self._canvas.itemconfig(self._canvas_window, width=e.width)
-
     def _render_empty(self):
-        for w in self._list_frame.winfo_children():
+        for w in self._lf.winfo_children():
             w.destroy()
-        self._row_frames.clear()
-        lbl = tk.Label(
-            self._list_frame,
-            text="PPTX 파일을 드래그하거나 [파일 추가] 버튼을 눌러 추가하세요",
-            bg=COLOR_CARD, fg=COLOR_SUBTEXT,
-            font=("Segoe UI", 10),
-            pady=30,
-        )
-        lbl.pack(fill="x")
+        tk.Label(self._lf,
+                 text="PPTX 파일을 드래그하거나 [파일 추가] 버튼으로 추가하세요",
+                 bg=COLOR_CARD, fg=COLOR_SUBTEXT,
+                 font=("Segoe UI", 10), pady=30).pack(fill="x")
 
     def refresh(self):
-        for w in self._list_frame.winfo_children():
+        for w in self._lf.winfo_children():
             w.destroy()
-        self._row_frames.clear()
-
         if not self._items:
             self._render_empty()
             return
 
+        ST_COLOR = {ST_WAITING: COLOR_SUBTEXT, ST_RUNNING: COLOR_ACCENT,
+                    ST_DONE: COLOR_SUCCESS, ST_ERROR: COLOR_ERROR}
+
         for i, item in enumerate(self._items):
             bg = COLOR_ROW_ODD if i % 2 == 0 else COLOR_ROW_EVEN
-            if item.status == ST_DONE:
-                bg = COLOR_ROW_DONE
-            elif item.status == ST_ERROR:
-                bg = COLOR_ROW_ERR
-            if i == self._selected_idx:
-                bg = COLOR_ROW_SEL
+            if item.status == ST_DONE:  bg = COLOR_ROW_DONE
+            if item.status == ST_ERROR: bg = COLOR_ROW_ERR
+            if i == self._selected_idx: bg = COLOR_ROW_SEL
 
-            row = tk.Frame(self._list_frame, bg=bg, cursor="hand2")
+            row = tk.Frame(self._lf, bg=bg, cursor="hand2")
             row.pack(fill="x")
-            self._row_frames.append(row)
+            st_color = ST_COLOR.get(item.status, COLOR_TEXT)
 
-            vals = [
-                (str(i + 1),       40,  "center"),
-                (item.name,        280, "w"),
-                (item.slides,      70,  "center"),
-                (item.status,      90,  "center"),
-                (item.message,     120, "w"),
-            ]
-            # 상태 색상
-            st_color = {
-                ST_WAITING: COLOR_SUBTEXT,
-                ST_RUNNING: COLOR_ACCENT,
-                ST_DONE:    COLOR_SUCCESS,
-                ST_ERROR:   COLOR_ERROR,
-            }.get(item.status, COLOR_TEXT)
-
-            for j, (val, width, anchor) in enumerate(vals):
+            for j, (val, width, anchor) in enumerate([
+                (str(i + 1),   40,  "center"),
+                (item.name,    270, "w"),
+                (item.slides,  70,  "center"),
+                (item.status,  90,  "center"),
+                (item.message, 130, "w"),
+            ]):
                 color = st_color if j == 3 else COLOR_TEXT
-                tk.Label(
-                    row, text=val,
-                    bg=bg, fg=color,
-                    font=("Segoe UI", 9),
-                    width=width // 7, anchor=anchor,
-                    padx=6, pady=7,
-                ).pack(side="left")
+                tk.Label(row, text=val, bg=bg, fg=color,
+                         font=("Segoe UI", 9),
+                         width=width // 7, anchor=anchor,
+                         padx=6, pady=7).pack(side="left")
 
-            idx = i  # 클로저 캡처
-            row.bind("<Button-1>", lambda e, n=idx: self._on_row_click(n))
-            for child in row.winfo_children():
-                child.bind("<Button-1>", lambda e, n=idx: self._on_row_click(n))
+            for w in [row] + row.winfo_children():
+                w.bind("<Button-1>", lambda e, n=i: self._click(n))
 
-        # 구분선
-        tk.Frame(self._list_frame, bg=COLOR_BORDER, height=1).pack(fill="x")
+        tk.Frame(self._lf, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-    def _on_row_click(self, idx):
+    def _click(self, idx):
         self._selected_idx = idx
         self.refresh()
         if self._on_select:
             self._on_select(self._items[idx])
 
-    def add_paths(self, paths: list[str]):
-        existing = {item.path for item in self._items}
+    def add_paths(self, paths):
+        existing = {it.path for it in self._items}
         added = 0
         for p in paths:
-            p = p.strip().strip("{}")  # tkinterdnd2 중괄호 제거
+            p = p.strip().strip("{}")
             if p.lower().endswith(".pptx") and p not in existing:
                 self._items.append(FileItem(p))
                 existing.add(p)
@@ -281,159 +312,130 @@ class FileListWidget(tk.Frame):
         self._selected_idx = -1
         self.refresh()
 
-    def update_item(self, idx, **kwargs):
+    def update_item(self, idx, **kw):
         if 0 <= idx < len(self._items):
-            item = self._items[idx]
-            for k, v in kwargs.items():
-                setattr(item, k, v)
+            for k, v in kw.items():
+                setattr(self._items[idx], k, v)
             self.refresh()
 
     @property
     def items(self):
         return self._items
 
-    @property
-    def selected(self):
-        if 0 <= self._selected_idx < len(self._items):
-            return self._items[self._selected_idx]
-        return None
 
+# ── 공용: 탭 기본 프레임 ─────────────────────────────────────
 
-# ── 메인 앱 ──────────────────────────────────────────────────
+class BaseTabFrame(tk.Frame):
+    """두 탭이 공유하는 드롭존 / 파일목록 / 진행바 / 버튼 뼈대"""
 
-class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("PPTX 텍스트 추출기")
-        self.geometry("780x640")
-        self.minsize(640, 520)
-        self.configure(bg=COLOR_BG)
-        self.resizable(True, True)
-
-        try:
-            self.iconbitmap(default="")
-        except Exception:
-            pass
-
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=COLOR_BG, **kw)
         self._last_output_folder = ""
-        self._is_running = False
-        self._queue = queue.Queue()   # 스레드 → 메인 스레드 통신용
+        self._is_running         = False
+        self._queue              = queue.Queue()
 
-        self._build_ui()
-        self._center_window()
+    # ── 공통 UI 빌더 헬퍼 ────────────────────────────────────
 
-    def _center_window(self):
-        self.update_idletasks()
-        w, h = self.winfo_width(), self.winfo_height()
-        x = (self.winfo_screenwidth()  - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+    def _card(self, parent, title, expand=False):
+        outer = tk.Frame(parent, bg=COLOR_BORDER)
+        outer.pack(fill="both" if expand else "x",
+                   expand=expand, pady=(0, 10))
+        inner = tk.Frame(outer, bg=COLOR_CARD, padx=14, pady=12)
+        inner.pack(fill="both", expand=expand, padx=1, pady=1)
+        if title:
+            tk.Label(inner, text=title, bg=COLOR_CARD, fg=COLOR_SUBTEXT,
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 8))
+        return inner
 
-    # ── UI 구성 ───────────────────────────────────────────────
+    def _accent_btn(self, parent, text, cmd, big=False, **kw):
+        btn = tk.Button(parent, text=text,
+                        bg=COLOR_ACCENT, fg="white",
+                        activebackground=COLOR_ACCENT_H,
+                        activeforeground="white",
+                        font=("Segoe UI", 10 if not big else 11, "bold"),
+                        relief="flat", bd=0,
+                        padx=12, pady=6 if not big else 9,
+                        cursor="hand2", command=cmd, **kw)
+        btn.bind("<Enter>", lambda e: btn.configure(
+            bg=COLOR_ACCENT_H if str(btn["state"]) != "disabled" else COLOR_BORDER))
+        btn.bind("<Leave>", lambda e: btn.configure(
+            bg=COLOR_ACCENT if str(btn["state"]) != "disabled" else COLOR_BORDER))
+        return btn
 
-    def _build_ui(self):
-        # 헤더
-        header = tk.Frame(self, bg=COLOR_ACCENT, height=56)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="📄  PPTX 텍스트 추출기",
-                 bg=COLOR_ACCENT, fg="white",
-                 font=("Segoe UI", 14, "bold"), padx=20
-                 ).pack(side="left", fill="y")
-        tk.Label(header, text="오탈자 검토용 TXT 일괄 변환",
-                 bg=COLOR_ACCENT, fg="#C8DFEF",
-                 font=("Segoe UI", 10), padx=4
-                 ).pack(side="left", fill="y")
+    def _ghost_btn(self, parent, text, cmd, **kw):
+        btn = tk.Button(parent, text=text,
+                        bg=COLOR_CARD, fg=COLOR_SUBTEXT,
+                        activebackground=COLOR_BORDER,
+                        activeforeground=COLOR_TEXT,
+                        font=("Segoe UI", 9),
+                        relief="flat", bd=0,
+                        padx=10, pady=6,
+                        cursor="hand2", command=cmd, **kw)
+        btn.bind("<Enter>", lambda e: btn.configure(bg=COLOR_BORDER, fg=COLOR_TEXT))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=COLOR_CARD,   fg=COLOR_SUBTEXT))
+        return btn
 
-        body = tk.Frame(self, bg=COLOR_BG)
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-
-        self._build_drop_zone(body)
-        self._build_file_list(body)
-        self._build_progress_area(body)
-        self._build_bottom_bar()
-
-    def _build_drop_zone(self, parent):
-        """드래그 앤 드롭 안내 영역"""
+    def _build_drop_zone(self, parent, hint_text):
         outer = tk.Frame(parent, bg=COLOR_BORDER)
         outer.pack(fill="x", pady=(0, 10))
-        inner = tk.Frame(outer, bg=COLOR_DROPZONE, padx=0, pady=0)
+        inner = tk.Frame(outer, bg=COLOR_DROPZONE)
         inner.pack(fill="x", padx=1, pady=1)
-
-        self._drop_zone = tk.Frame(inner, bg=COLOR_DROPZONE, pady=18)
+        self._drop_zone = tk.Frame(inner, bg=COLOR_DROPZONE, pady=16)
         self._drop_zone.pack(fill="x")
-
-        tk.Label(self._drop_zone,
-                 text="여기에 PPTX 파일을 드래그 앤 드롭하세요",
+        tk.Label(self._drop_zone, text=hint_text,
                  bg=COLOR_DROPZONE, fg=COLOR_ACCENT,
                  font=("Segoe UI", 11, "bold")).pack()
         tk.Label(self._drop_zone,
                  text="여러 파일을 한 번에 드롭하거나, 아래 [파일 추가] 버튼으로 선택할 수 있습니다",
                  bg=COLOR_DROPZONE, fg=COLOR_SUBTEXT,
                  font=("Segoe UI", 9)).pack(pady=(4, 0))
-
         if not DND_AVAILABLE:
-            tk.Label(self._drop_zone,
-                     text="⚠  tkinterdnd2 미설치 — 드래그 앤 드롭 비활성",
+            tk.Label(self._drop_zone, text="⚠  tkinterdnd2 미설치 — 드래그 앤 드롭 비활성",
                      bg=COLOR_DROPZONE, fg=COLOR_WARN,
-                     font=("Segoe UI", 8)).pack(pady=(6, 0))
-
-        # 드래그 앤 드롭 이벤트 바인딩
+                     font=("Segoe UI", 8)).pack(pady=(4, 0))
+        self._drop_outer = outer
         if DND_AVAILABLE:
-            for widget in [self._drop_zone, outer, inner] + self._drop_zone.winfo_children():
+            for w in [outer, inner, self._drop_zone] + self._drop_zone.winfo_children():
                 try:
-                    widget.drop_target_register(DND_FILES)
-                    widget.dnd_bind("<<Drop>>", self._on_drop)
-                    widget.dnd_bind("<<DragEnter>>", self._on_drag_enter)
-                    widget.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>",      self._on_drop)
+                    w.dnd_bind("<<DragEnter>>", self._on_drag_enter)
+                    w.dnd_bind("<<DragLeave>>", self._on_drag_leave)
                 except Exception:
                     pass
+        return outer
 
-        self._drop_outer = outer
-        self._drop_inner = inner
-
-    def _build_file_list(self, parent):
-        """파일 목록 테이블 + 목록 조작 버튼"""
+    def _build_file_list_area(self, parent):
         outer = tk.Frame(parent, bg=COLOR_BORDER)
         outer.pack(fill="both", expand=True, pady=(0, 10))
         inner = tk.Frame(outer, bg=COLOR_CARD)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # 목록 상단 툴바
         toolbar = tk.Frame(inner, bg=COLOR_CARD, pady=8, padx=10)
         toolbar.pack(fill="x")
-        tk.Label(toolbar, text="파일 목록",
-                 bg=COLOR_CARD, fg=COLOR_SUBTEXT,
+        tk.Label(toolbar, text="파일 목록", bg=COLOR_CARD, fg=COLOR_SUBTEXT,
                  font=("Segoe UI", 9, "bold")).pack(side="left")
-
         self._lbl_count = tk.Label(toolbar, text="0개",
                                    bg=COLOR_CARD, fg=COLOR_ACCENT,
                                    font=("Segoe UI", 9, "bold"))
         self._lbl_count.pack(side="left", padx=(6, 0))
 
-        # 목록 조작 버튼 (우측)
-        self._btn_clear = self._ghost_button(toolbar, "전체 삭제", self._on_clear_all)
+        self._btn_clear  = self._ghost_btn(toolbar, "전체 삭제", self._on_clear_all)
         self._btn_clear.pack(side="right", padx=(6, 0))
-
-        self._btn_remove = self._ghost_button(toolbar, "선택 삭제", self._on_remove)
+        self._btn_remove = self._ghost_btn(toolbar, "선택 삭제", self._on_remove)
         self._btn_remove.pack(side="right", padx=(6, 0))
-
-        self._btn_add = self._accent_button(toolbar, "+ 파일 추가", self._on_add_files)
+        self._btn_add    = self._accent_btn(toolbar, "+ 파일 추가", self._on_add_files)
         self._btn_add.pack(side="right", padx=(6, 0))
 
         tk.Frame(inner, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-        # 파일 목록 테이블
-        self._file_list = FileListWidget(
-            inner, on_select=self._on_file_select, height=180
-        )
+        self._file_list = FileListWidget(inner, height=180)
         self._file_list.pack(fill="both", expand=True)
 
-        # 드롭 이벤트를 파일 목록에도 연결
         if DND_AVAILABLE:
             try:
                 self._file_list.drop_target_register(DND_FILES)
-                self._file_list.dnd_bind("<<Drop>>", self._on_drop)
+                self._file_list.dnd_bind("<<Drop>>",      self._on_drop)
                 self._file_list.dnd_bind("<<DragEnter>>", self._on_drag_enter)
                 self._file_list.dnd_bind("<<DragLeave>>", self._on_drag_leave)
             except Exception:
@@ -447,30 +449,27 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         top = tk.Frame(card, bg=COLOR_CARD)
         top.pack(fill="x")
-        self._lbl_status = tk.Label(top, text="파일을 추가하고 추출을 시작하세요.",
+        self._lbl_status = tk.Label(top, text="파일을 추가하고 시작하세요.",
                                     bg=COLOR_CARD, fg=COLOR_SUBTEXT,
                                     font=("Segoe UI", 10))
         self._lbl_status.pack(side="left")
+        self._lbl_prog_text = tk.Label(top, text="", bg=COLOR_CARD,
+                                       fg=COLOR_SUBTEXT, font=("Segoe UI", 9))
+        self._lbl_prog_text.pack(side="right")
 
-        self._lbl_progress_text = tk.Label(top, text="",
-                                           bg=COLOR_CARD, fg=COLOR_SUBTEXT,
-                                           font=("Segoe UI", 9))
-        self._lbl_progress_text.pack(side="right")
-
-        style = ttk.Style(self)
-        style.theme_use("clam")
+        style = ttk.Style()
         style.configure("Accent.Horizontal.TProgressbar",
                         troughcolor=COLOR_BORDER, background=COLOR_ACCENT,
-                        bordercolor=COLOR_BORDER, lightcolor=COLOR_ACCENT,
-                        darkcolor=COLOR_ACCENT)
+                        bordercolor=COLOR_BORDER,
+                        lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT)
         self._progressbar = ttk.Progressbar(
             card, style="Accent.Horizontal.TProgressbar",
             orient="horizontal", mode="determinate")
         self._progressbar.pack(fill="x", ipady=3, pady=(8, 0))
 
-    def _build_bottom_bar(self):
-        bar = tk.Frame(self, bg=COLOR_BG)
-        bar.pack(fill="x", padx=20, pady=(0, 16))
+    def _build_bottom_bar(self, parent, run_text, run_cmd):
+        bar = tk.Frame(parent, bg=COLOR_BG)
+        bar.pack(fill="x", pady=(0, 16))
 
         self._btn_open_folder = tk.Button(
             bar, text="📂  저장 폴더 열기",
@@ -478,16 +477,14 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             font=("Segoe UI", 10), relief="flat", bd=0,
             padx=14, pady=8, cursor="hand2", state="disabled",
             activebackground=COLOR_BORDER,
-            command=self._on_open_folder,
-        )
+            command=self._on_open_folder)
         self._btn_open_folder.pack(side="left")
 
-        self._btn_run = self._accent_button(
-            bar, "  텍스트 추출 시작  ", self._on_run_all, big=True)
+        self._btn_run = self._accent_btn(bar, run_text, run_cmd, big=True)
         self._btn_run.pack(side="right")
         self._btn_run.configure(state="disabled")
 
-    # ── 드래그 앤 드롭 이벤트 ─────────────────────────────────
+    # ── 공통 이벤트 ──────────────────────────────────────────
 
     def _on_drag_enter(self, event):
         self._drop_zone.configure(bg=COLOR_DROP_ACT)
@@ -500,20 +497,14 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def _on_drop(self, event):
         self._drop_zone.configure(bg=COLOR_DROPZONE)
         self._drop_outer.configure(bg=COLOR_BORDER)
-
-        # tkinterdnd2는 여러 파일을 공백 구분 또는 중괄호 묶음으로 전달
-        raw = event.data
-        paths = self._parse_drop_data(raw)
+        paths = self._parse_drop(event.data)
         added = self._file_list.add_paths(paths)
         self._update_count()
         if added:
-            self._set_run_button_state()
+            self._sync_run_btn()
 
-    def _parse_drop_data(self, raw: str) -> list[str]:
-        """tkinterdnd2 드롭 데이터 파싱 (경로에 공백 포함 가능)"""
-        paths = []
-        raw = raw.strip()
-        i = 0
+    def _parse_drop(self, raw):
+        paths, raw, i = [], raw.strip(), 0
         while i < len(raw):
             if raw[i] == "{":
                 end = raw.find("}", i)
@@ -531,219 +522,335 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 i = end + 1
         return [p.strip() for p in paths if p.strip()]
 
-    # ── 버튼 이벤트 핸들러 ────────────────────────────────────
-
     def _on_add_files(self):
         paths = filedialog.askopenfilenames(
             title="PPTX 파일 선택 (다중 선택 가능)",
-            filetypes=[("PowerPoint 파일", "*.pptx"), ("모든 파일", "*.*")],
-        )
+            filetypes=[("PowerPoint 파일", "*.pptx"), ("모든 파일", "*.*")])
         if paths:
             self._file_list.add_paths(list(paths))
             self._update_count()
-            self._set_run_button_state()
+            self._sync_run_btn()
 
     def _on_remove(self):
         self._file_list.remove_selected()
         self._update_count()
-        self._set_run_button_state()
+        self._sync_run_btn()
 
     def _on_clear_all(self):
         self._file_list.clear_all()
         self._update_count()
-        self._set_run_button_state()
-        self._lbl_status.configure(text="파일을 추가하고 추출을 시작하세요.", fg=COLOR_SUBTEXT)
+        self._sync_run_btn()
+        self._lbl_status.configure(text="파일을 추가하고 시작하세요.", fg=COLOR_SUBTEXT)
         self._progressbar["value"] = 0
-        self._lbl_progress_text.configure(text="")
+        self._lbl_prog_text.configure(text="")
         self._btn_open_folder.configure(state="disabled")
 
-    def _on_file_select(self, item: FileItem):
-        pass  # 선택 시 추후 미리보기 확장 가능
+    def _on_open_folder(self):
+        if self._last_output_folder and os.path.isdir(self._last_output_folder):
+            subprocess.Popen(["explorer", self._last_output_folder])
 
-    def _on_run_all(self):
-        items = self._file_list.items
-        if not items or self._is_running:
-            return
+    def _update_count(self):
+        self._lbl_count.configure(text=f"{len(self._file_list.items)}개")
 
-        targets = [i for i, it in enumerate(items)
-                   if it.status in (ST_WAITING, ST_ERROR)]
-        if not targets:
-            for item in items:
-                item.status = ST_WAITING
-                item.slides = ""
-                item.message = ""
-            targets = list(range(len(items)))
-            self._file_list.refresh()
+    def _sync_run_btn(self):
+        state = "normal" if self._file_list.items and not self._is_running else "disabled"
+        self._btn_run.configure(state=state)
 
+    def _start_run(self, thread_target, targets):
         self._is_running = True
-
-        # Queue 초기화 (이전 잔여 메시지 제거)
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
-
-        self._btn_run.configure(state="disabled", text="  추출 중...  ")
+        self._btn_run.configure(state="disabled", text="  처리 중...  ")
         self._btn_add.configure(state="disabled")
         self._btn_remove.configure(state="disabled")
         self._btn_clear.configure(state="disabled")
         self._btn_open_folder.configure(state="disabled")
         self._progressbar["value"] = 0
         self._last_output_folder = ""
-
-        thread = threading.Thread(
-            target=self._run_all_thread, args=(targets,), daemon=True)
-        thread.start()
-
-        # Queue 폴링 시작 (메인 스레드에서 50ms마다 메시지 처리)
+        threading.Thread(target=thread_target, args=(targets,), daemon=True).start()
         self.after(50, self._poll_queue)
-
-    # ── Queue 폴링: 스레드 메시지를 메인 스레드에서 안전하게 처리 ──────────
-    # 스레드는 절대 after()를 호출하지 않고, Queue에만 메시지를 넣는다.
-    # 메인 스레드의 _poll_queue()가 꺼내서 UI를 업데이트한다.
 
     def _poll_queue(self):
         try:
             while True:
                 msg = self._queue.get_nowait()
-                kind = msg[0]
-
-                if kind == "running":
-                    _, idx, job_num, total_files, name = msg
-                    self._file_list.update_item(idx, status=ST_RUNNING, message="")
-                    self._lbl_status.configure(
-                        text=f"[{job_num}/{total_files}]  {name}", fg=COLOR_ACCENT)
-
-                elif kind == "progress":
-                    _, pct, cur, total_slides, jn, tf = msg
-                    self._progressbar["value"] = pct
-                    self._lbl_progress_text.configure(
-                        text=f"파일 {jn}/{tf}  |  Slide {cur}/{total_slides}  ({pct}%)")
-
-                elif kind == "done":
-                    _, idx, total_slides, out_path = msg
-                    self._last_output_folder = os.path.dirname(out_path)
-                    self._file_list.update_item(
-                        idx, status=ST_DONE,
-                        slides=str(total_slides),
-                        message="저장 완료",
-                        output=out_path)
-
-                elif kind == "error":
-                    _, idx, err_msg = msg
-                    self._file_list.update_item(
-                        idx, status=ST_ERROR, message=err_msg)
-
-                elif kind == "all_done":
-                    _, total_files = msg
-                    self._on_all_done(total_files)
-                    return  # 완료 → 폴링 중단
-
+                if self._handle_msg(msg):
+                    return   # all_done → 폴링 중단
         except queue.Empty:
             pass
-
-        # 아직 실행 중이면 계속 폴링
         if self._is_running:
             self.after(50, self._poll_queue)
 
-    # ── 백그라운드 추출 스레드 (Queue에만 메시지 전송, UI 직접 접근 금지) ──
+    def _handle_msg(self, msg):
+        """메시지 처리. all_done 이면 True 반환."""
+        kind = msg[0]
+        if kind == "running":
+            _, idx, jn, tf, name = msg
+            self._file_list.update_item(idx, status=ST_RUNNING, message="")
+            self._lbl_status.configure(
+                text=f"[{jn}/{tf}]  {name}", fg=COLOR_ACCENT)
 
-    def _run_all_thread(self, target_indices):
-        items = self._file_list.items
-        total_files = len(target_indices)
+        elif kind == "progress":
+            _, pct, cur, total, jn, tf = msg
+            self._progressbar["value"] = pct
+            self._lbl_prog_text.configure(
+                text=f"파일 {jn}/{tf}  |  Slide {cur}/{total}  ({pct}%)")
 
-        try:
-            for job_num, idx in enumerate(target_indices, start=1):
-                item = items[idx]
-                self._queue.put(("running", idx, job_num, total_files, item.name))
+        elif kind == "done":
+            _, idx, slides, out = msg
+            self._last_output_folder = os.path.dirname(out)
+            self._file_list.update_item(
+                idx, status=ST_DONE, slides=str(slides),
+                message="저장 완료", output=out)
 
-                def make_progress_cb(jn, tf):
-                    def cb(cur, total_slides):
-                        pct = int(((jn - 1) + cur / total_slides) / tf * 100)
-                        self._queue.put(("progress", pct, cur, total_slides, jn, tf))
-                    return cb
+        elif kind == "error":
+            _, idx, err = msg
+            self._file_list.update_item(idx, status=ST_ERROR, message=err)
 
-                try:
-                    out, total_slides, empty = extract_pptx_to_txt(
-                        item.path,
-                        progress_callback=make_progress_cb(job_num, total_files),
-                    )
-                    self._queue.put(("done", idx, total_slides, out))
-                except Exception as e:
-                    self._queue.put(("error", idx, str(e)[:60]))
+        elif kind == "all_done":
+            _, tf = msg
+            self._finish(tf)
+            return True
 
-        except Exception as e:
-            # 예기치 않은 스레드 전체 오류도 Queue로 전달
-            self._queue.put(("error", 0, f"Thread error: {e}"))
+        return False
 
-        self._queue.put(("all_done", total_files))
-
-    def _on_all_done(self, total_files):
+    def _finish(self, total_files):
         self._is_running = False
         items = self._file_list.items
         done  = sum(1 for it in items if it.status == ST_DONE)
-        error = sum(1 for it in items if it.status == ST_ERROR)
-
-        if error == 0:
+        err   = sum(1 for it in items if it.status == ST_ERROR)
+        if err == 0:
             self._lbl_status.configure(
-                text=f"✅  전체 완료 — {done}개 파일 추출 성공", fg=COLOR_SUCCESS)
+                text=f"✅  전체 완료 — {done}개 파일 처리 성공", fg=COLOR_SUCCESS)
         else:
             self._lbl_status.configure(
-                text=f"⚠  완료 — 성공 {done}개 / 오류 {error}개", fg=COLOR_WARN)
-
+                text=f"⚠  완료 — 성공 {done}개 / 오류 {err}개", fg=COLOR_WARN)
         self._progressbar["value"] = 100
-        self._lbl_progress_text.configure(text="")
-        self._btn_run.configure(state="normal", text="  텍스트 추출 시작  ")
+        self._lbl_prog_text.configure(text="")
+        self._btn_run.configure(state="normal", text=self._run_label)
         self._btn_add.configure(state="normal")
         self._btn_remove.configure(state="normal")
         self._btn_clear.configure(state="normal")
         if self._last_output_folder:
             self._btn_open_folder.configure(state="normal")
 
-    def _on_open_folder(self):
-        if self._last_output_folder and os.path.isdir(self._last_output_folder):
-            subprocess.Popen(["explorer", self._last_output_folder])
 
-    # ── 헬퍼 ─────────────────────────────────────────────────
+# ── Tab 1: 텍스트 추출 ───────────────────────────────────────
 
-    def _update_count(self):
-        n = len(self._file_list.items)
-        self._lbl_count.configure(text=f"{n}개")
+class TextExtractTab(BaseTabFrame):
+    _run_label = "  텍스트 추출 시작  "
 
-    def _set_run_button_state(self):
-        has_items = bool(self._file_list.items)
-        self._btn_run.configure(state="normal" if has_items else "disabled")
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.pack(fill="both", expand=True)
+        body = tk.Frame(self, bg=COLOR_BG)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
 
-    def _accent_button(self, parent, text, command, big=False, **kw):
-        btn = tk.Button(
-            parent, text=text,
-            bg=COLOR_ACCENT, fg="white",
-            activebackground=COLOR_ACCENT_H, activeforeground="white",
-            font=("Segoe UI", 10 if not big else 11, "bold"),
-            relief="flat", bd=0,
-            padx=12, pady=6 if not big else 9,
-            cursor="hand2", command=command, **kw,
-        )
-        btn.bind("<Enter>", lambda e: btn.configure(
-            bg=COLOR_ACCENT_H if btn["state"] != "disabled" else COLOR_BORDER))
-        btn.bind("<Leave>", lambda e: btn.configure(
-            bg=COLOR_ACCENT if btn["state"] != "disabled" else COLOR_BORDER))
-        return btn
+        self._build_drop_zone(body, "여기에 PPTX 파일을 드래그 앤 드롭하세요")
+        self._build_file_list_area(body)
+        self._build_progress_area(body)
+        self._build_bottom_bar(body, self._run_label, self._on_run)
 
-    def _ghost_button(self, parent, text, command, **kw):
-        btn = tk.Button(
-            parent, text=text,
-            bg=COLOR_CARD, fg=COLOR_SUBTEXT,
-            activebackground=COLOR_BORDER, activeforeground=COLOR_TEXT,
-            font=("Segoe UI", 9),
-            relief="flat", bd=0,
-            padx=10, pady=6,
-            cursor="hand2", command=command, **kw,
-        )
-        btn.bind("<Enter>", lambda e: btn.configure(bg=COLOR_BORDER, fg=COLOR_TEXT))
-        btn.bind("<Leave>", lambda e: btn.configure(bg=COLOR_CARD,   fg=COLOR_SUBTEXT))
-        return btn
+    def _on_run(self):
+        items = self._file_list.items
+        if not items or self._is_running:
+            return
+        targets = [i for i, it in enumerate(items)
+                   if it.status in (ST_WAITING, ST_ERROR)]
+        if not targets:
+            for it in items:
+                it.status = ST_WAITING; it.slides = ""; it.message = ""
+            targets = list(range(len(items)))
+            self._file_list.refresh()
+        self._start_run(self._thread, targets)
+
+    def _thread(self, target_indices):
+        items      = self._file_list.items
+        total_files = len(target_indices)
+        try:
+            for jn, idx in enumerate(target_indices, start=1):
+                item = items[idx]
+                self._queue.put(("running", idx, jn, total_files, item.name))
+
+                def make_cb(j, tf):
+                    def cb(cur, tot):
+                        pct = int(((j - 1) + cur / tot) / tf * 100)
+                        self._queue.put(("progress", pct, cur, tot, j, tf))
+                    return cb
+
+                try:
+                    out, slides, _ = extract_pptx_to_txt(
+                        item.path, progress_callback=make_cb(jn, total_files))
+                    self._queue.put(("done", idx, slides, out))
+                except Exception as e:
+                    self._queue.put(("error", idx, str(e)[:60]))
+        except Exception as e:
+            self._queue.put(("error", 0, f"Thread error: {e}"))
+        self._queue.put(("all_done", total_files))
+
+
+# ── Tab 2: PDF 변환 ──────────────────────────────────────────
+
+class PDFConvertTab(BaseTabFrame):
+    _run_label = "  PDF 변환 시작  "
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.pack(fill="both", expand=True)
+        body = tk.Frame(self, bg=COLOR_BG)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        self._build_drop_zone(body, "여기에 PPTX 파일을 드래그 앤 드롭하세요")
+        self._build_dpi_selector(body)
+        self._build_file_list_area(body)
+        self._build_progress_area(body)
+        self._build_bottom_bar(body, self._run_label, self._on_run)
+
+    def _build_dpi_selector(self, parent):
+        card = self._card(parent, "이미지 해상도 (DPI) 선택")
+
+        row = tk.Frame(card, bg=COLOR_CARD)
+        row.pack(anchor="w")
+
+        self._dpi_var = tk.IntVar(value=220)
+
+        for dpi, label in [(96,  "96 dpi  — 빠른 변환 / 저용량"),
+                           (220, "220 dpi — 권장 (균형)"),
+                           (300, "300 dpi — 고품질 / 대용량")]:
+            rb = tk.Radiobutton(
+                row, text=label, variable=self._dpi_var, value=dpi,
+                bg=COLOR_CARD, fg=COLOR_TEXT,
+                activebackground=COLOR_CARD,
+                font=("Segoe UI", 10),
+                selectcolor=COLOR_CARD,
+                cursor="hand2")
+            rb.pack(side="left", padx=(0, 24))
+
+        tk.Label(card,
+                 text="⚠  변환에는 PC에 Microsoft PowerPoint가 설치되어 있어야 합니다.",
+                 bg=COLOR_CARD, fg=COLOR_WARN,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(8, 0))
+
+    def _on_run(self):
+        items = self._file_list.items
+        if not items or self._is_running:
+            return
+        targets = [i for i, it in enumerate(items)
+                   if it.status in (ST_WAITING, ST_ERROR)]
+        if not targets:
+            for it in items:
+                it.status = ST_WAITING; it.slides = ""; it.message = ""
+            targets = list(range(len(items)))
+            self._file_list.refresh()
+        self._start_run(self._thread, targets)
+
+    def _thread(self, target_indices):
+        items       = self._file_list.items
+        total_files = len(target_indices)
+        dpi         = self._dpi_var.get()
+        try:
+            for jn, idx in enumerate(target_indices, start=1):
+                item = items[idx]
+                self._queue.put(("running", idx, jn, total_files, item.name))
+
+                def make_cb(j, tf):
+                    def cb(cur, tot):
+                        pct = int(((j - 1) + cur / tot) / tf * 100)
+                        self._queue.put(("progress", pct, cur, tot, j, tf))
+                    return cb
+
+                try:
+                    out, slides = convert_pptx_to_pdf(
+                        item.path, dpi,
+                        progress_callback=make_cb(jn, total_files))
+                    self._queue.put(("done", idx, slides, out))
+                except Exception as e:
+                    self._queue.put(("error", idx, str(e)[:60]))
+        except Exception as e:
+            self._queue.put(("error", 0, f"Thread error: {e}"))
+        self._queue.put(("all_done", total_files))
+
+
+# ── 메인 앱 ──────────────────────────────────────────────────
+
+class PPTXUtilityApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("PPTX Utility")
+        self.geometry("780x700")
+        self.minsize(660, 580)
+        self.configure(bg=COLOR_BG)
+        self.resizable(True, True)
+        try:
+            self.iconbitmap(default="")
+        except Exception:
+            pass
+
+        self._active_tab = None
+        self._tab_frames = {}
+        self._tab_btns   = {}
+
+        self._build_tab_bar()
+        self._build_tabs()
+        self._switch_tab("text")
+        self._center_window()
+
+    def _center_window(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth()  - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_tab_bar(self):
+        bar = tk.Frame(self, bg=COLOR_TAB_ACT, height=48)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        self._tab_btn_bar = bar
+
+        for key, label in [("text", "텍스트 추출"), ("pdf", "PDF 저장")]:
+            btn = tk.Button(
+                bar, text=label,
+                font=("Segoe UI", 11, "bold"),
+                relief="flat", bd=0,
+                padx=28, pady=0,
+                cursor="hand2",
+                command=lambda k=key: self._switch_tab(k))
+            btn.pack(side="left", fill="y")
+            self._tab_btns[key] = btn
+
+    def _build_tabs(self):
+        container = tk.Frame(self, bg=COLOR_BG)
+        container.pack(fill="both", expand=True)
+
+        self._tab_frames["text"] = TextExtractTab(container)
+        self._tab_frames["pdf"]  = PDFConvertTab(container)
+
+        for f in self._tab_frames.values():
+            f.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _switch_tab(self, key):
+        if self._active_tab == key:
+            return
+        self._active_tab = key
+        for k, frame in self._tab_frames.items():
+            if k == key:
+                frame.lift()
+            else:
+                frame.lower()
+        for k, btn in self._tab_btns.items():
+            if k == key:
+                btn.configure(bg=COLOR_CARD, fg=COLOR_TAB_ACT,
+                              highlightbackground=COLOR_ACCENT,
+                              highlightthickness=2)
+            else:
+                btn.configure(bg=COLOR_TAB_ACT, fg="#AAAAAA",
+                              highlightthickness=0)
 
 
 # ── 진입점 ────────────────────────────────────────────────────
@@ -756,5 +863,5 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    app = PPTXExtractorApp()
+    app = PPTXUtilityApp()
     app.mainloop()
