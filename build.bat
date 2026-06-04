@@ -69,7 +69,7 @@ echo [OK] %PY_VER_STR% ready
 echo.
 
 echo [1/3] Installing packages...
-python -m pip install python-pptx tkinterdnd2 pywin32 Pillow pyinstaller --quiet --disable-pip-version-check
+python -m pip install python-pptx tkinterdnd2 pywin32 Pillow pymupdf pyinstaller --quiet --disable-pip-version-check
 if errorlevel 1 (
     echo [ERROR] Package installation failed.
     pause
@@ -87,7 +87,7 @@ echo.
 
 echo [3/3] Building EXE (may take 1-2 minutes)...
 echo.
-python -m PyInstaller --onefile --windowed --name "PPTX_Utility" --collect-all tkinterdnd2 --collect-all win32com "%SCRIPT_DEST%"
+python -m PyInstaller --onefile --windowed --name "PPTX_Utility" --collect-all tkinterdnd2 --collect-all win32com --collect-all fitz "%SCRIPT_DEST%"
 
 if errorlevel 1 (
     echo.

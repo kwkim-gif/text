@@ -145,10 +145,10 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     base     = os.path.splitext(os.path.basename(pptx_path))[0]
     out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
 
-    # COM Export 는 경로에 한글(비ASCII) 문자가 있으면 실패.
-    # %TEMP% 가 한글 사용자명 경로일 수 있으므로 ASCII 경로를 직접 선택.
-    temp_dir = _make_ascii_tempdir()
+    # ASCII 경로 임시 폴더 (COM 경로 오류 방지)
+    temp_dir  = _make_ascii_tempdir()
     temp_pptx = os.path.join(temp_dir, "input.pptx")
+    temp_pdf  = os.path.join(temp_dir, "intermediate.pdf")
     shutil.copy2(pptx_path, temp_pptx)
 
     ppt_app     = None
@@ -156,48 +156,52 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     prs         = None
 
     try:
-        # 기존에 실행 중인 PowerPoint 인스턴스가 있으면 재사용
-        # → 기존 창을 Quit() 으로 닫지 않기 위함
+        # 기존 PowerPoint 인스턴스 재사용 (없으면 새로 생성)
         try:
             ppt_app = win32com.client.GetActiveObject("PowerPoint.Application")
         except Exception:
             ppt_app     = win32com.client.Dispatch("PowerPoint.Application")
             created_new = True
 
-        # Export 는 반드시 Visible=True 상태에서 동작
         ppt_app.Visible = True
-
-        # WithWindow=True 로 열어야 Export 가 안정적으로 작동
-        prs = ppt_app.Presentations.Open(
-            temp_pptx, ReadOnly=True, Untitled=False, WithWindow=True)
-
-        # 열린 창을 바로 최소화 (화면 방해 최소화)
         try:
-            prs.Windows(1).WindowState = 2   # ppWindowMinimized = 2
+            ppt_app.WindowState = 2   # 앱 창 최소화
         except Exception:
             pass
 
-        # 슬라이드 크기(포인트) → 픽셀 (1pt = 1/72 inch)
-        w_px = int(prs.PageSetup.SlideWidth  / 72 * dpi)
-        h_px = int(prs.PageSetup.SlideHeight / 72 * dpi)
+        prs = ppt_app.Presentations.Open(
+            temp_pptx, ReadOnly=True, Untitled=False, WithWindow=True)
+        try:
+            prs.Windows(1).WindowState = 2   # 프레젠테이션 창도 최소화
+        except Exception:
+            pass
 
-        total     = prs.Slides.Count
-        img_paths = []
-
-        # JPG 는 모든 PowerPoint 버전에서 지원 → 기본 포맷으로 사용
-        # (PNG 는 일부 버전에서 필터 미설치로 실패)
-        for i in range(1, total + 1):
-            if progress_callback:
-                progress_callback(i, total)
-            img_file = os.path.join(temp_dir, f"slide_{i:04d}.jpg")
-            prs.Slides(i).Export(img_file, "JPG", w_px, h_px)
-            img_paths.append(img_file)
+        # ── Step 1: PPT → 중간 PDF (ExportAsFixedFormat 은 Slide.Export 보다 안정적)
+        # 2 = ppFixedFormatTypePDF
+        prs.ExportAsFixedFormat(temp_pdf, 2)
+        total = prs.Slides.Count
 
         prs.Close()
         prs = None
 
-        # 이미지 → PDF 병합
-        images = [Image.open(p).convert("RGB") for p in img_paths]
+        # ── Step 2: PDF 페이지 → 이미지 (PyMuPDF, 텍스트 레이어 제거 효과)
+        import fitz   # PyMuPDF
+        zoom      = dpi / 72   # PyMuPDF 기본 해상도는 72 DPI
+        doc       = fitz.open(temp_pdf)
+        img_paths = []
+
+        for i, page in enumerate(doc):
+            if progress_callback:
+                progress_callback(i + 1, total)
+            pix      = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            img_file = os.path.join(temp_dir, f"slide_{i+1:04d}.jpg")
+            pix.save(img_file)
+            img_paths.append(img_file)
+        doc.close()
+
+        # ── Step 3: 이미지 → 이미지 전용 PDF (텍스트 선택 불가)
+        from PIL import Image as PILImage
+        images = [PILImage.open(p).convert("RGB") for p in img_paths]
         if images:
             images[0].save(
                 out_path, save_all=True,
@@ -213,14 +217,11 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
                 prs.Close()
         except Exception:
             pass
-
-        # 직접 생성한 인스턴스만 종료 (기존 사용자 PPT 창은 유지)
         try:
             if created_new and ppt_app:
                 ppt_app.Quit()
         except Exception:
             pass
-
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return out_path, total
