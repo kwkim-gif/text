@@ -109,6 +109,31 @@ def extract_pptx_to_txt(pptx_path, progress_callback=None):
 
 # ── PPTX → 이미지 → PDF 변환 로직 ───────────────────────────
 
+def _make_ascii_tempdir():
+    """
+    COM Export 는 경로에 한글 등 비ASCII 문자가 있으면 실패.
+    %TEMP% 가 한글 사용자명 폴더일 수 있으므로,
+    ASCII 경로만 후보로 순서대로 시도하여 임시 폴더를 생성.
+    """
+    candidates = [
+        r"C:\Temp",
+        r"C:\Windows\Temp",
+        r"C:\ProgramData\pptx_tmp",
+        os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "Temp"),
+    ]
+    for base in candidates:
+        try:
+            base.encode("ascii")          # ASCII 경로인지 확인
+            os.makedirs(base, exist_ok=True)
+            td = tempfile.mkdtemp(prefix="pptxpdf_", dir=base)
+            return td
+        except (UnicodeEncodeError, OSError):
+            continue
+
+    # 최후 수단: 기본 임시 폴더 (경고만 하고 진행)
+    return tempfile.mkdtemp(prefix="pptxpdf_")
+
+
 def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     """
     win32com 으로 PowerPoint 를 제어해 슬라이드를 PNG 로 내보낸 뒤
@@ -120,9 +145,9 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     base     = os.path.splitext(os.path.basename(pptx_path))[0]
     out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
 
-    # 임시 폴더 (이미지 저장 + ASCII 경로 PPTX 복사본)
-    temp_dir  = tempfile.mkdtemp(prefix="pptxpdf_")
-    # 한글 파일명 → COM 경로 오류 방지: ASCII 이름으로 복사
+    # COM Export 는 경로에 한글(비ASCII) 문자가 있으면 실패.
+    # %TEMP% 가 한글 사용자명 경로일 수 있으므로 ASCII 경로를 직접 선택.
+    temp_dir = _make_ascii_tempdir()
     temp_pptx = os.path.join(temp_dir, "input.pptx")
     shutil.copy2(pptx_path, temp_pptx)
 
@@ -159,32 +184,13 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
         total     = prs.Slides.Count
         img_paths = []
 
-        # PNG 먼저 시도, 실패 시 JPG 로 재시도
-        # (PowerPoint 버전에 따라 PNG 필터가 없는 경우가 있음)
-        fmt, ext = "PNG", "png"
-        try:
-            test_file = os.path.join(temp_dir, "test.png")
-            prs.Slides(1).Export(test_file, "PNG", w_px, h_px)
-        except Exception:
-            fmt, ext = "JPG", "jpg"
-
-        # test_file 이 생성됐으면 슬라이드 1번으로 재사용
-        first_done = os.path.exists(os.path.join(temp_dir, "test.png"))
-        start_idx  = 1
-
-        if first_done:
-            renamed = os.path.join(temp_dir, f"slide_0001.{ext}")
-            os.rename(os.path.join(temp_dir, "test.png"), renamed)
-            img_paths.append(renamed)
-            if progress_callback:
-                progress_callback(1, total)
-            start_idx = 2
-
-        for i in range(start_idx, total + 1):
+        # JPG 는 모든 PowerPoint 버전에서 지원 → 기본 포맷으로 사용
+        # (PNG 는 일부 버전에서 필터 미설치로 실패)
+        for i in range(1, total + 1):
             if progress_callback:
                 progress_callback(i, total)
-            img_file = os.path.join(temp_dir, f"slide_{i:04d}.{ext}")
-            prs.Slides(i).Export(img_file, fmt, w_px, h_px)
+            img_file = os.path.join(temp_dir, f"slide_{i:04d}.jpg")
+            prs.Slides(i).Export(img_file, "JPG", w_px, h_px)
             img_paths.append(img_file)
 
         prs.Close()
