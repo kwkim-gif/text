@@ -153,24 +153,38 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     shutil.copy2(pptx_path, temp_pptx)
 
     try:
-        # ── Step 1: PowerShell 로 COM 자동화 (기존 PPT 창 보호 포함)
-        ps_script = (
-            "$ErrorActionPreference='Stop';"
-            "$ppt=$null; $new=$false;"
-            "try{$ppt=[Runtime.InteropServices.Marshal]::GetActiveObject('PowerPoint.Application')}catch{$ppt=New-Object -ComObject PowerPoint.Application;$new=$true};"
-            "$ppt.Visible=$true;"
-            "try{"
-            f"  $prs=$ppt.Presentations.Open('{temp_pptx}',$true,$false,$true);"
-            "  try{$prs.Windows(1).WindowState=2}catch{};"
-            f"  $prs.ExportAsFixedFormat('{temp_pdf}',2);"
-            "  $prs.Close()"
-            "}finally{"
-            "  if($new){$ppt.Quit()}"
-            "}"
-        )
+        # ── Step 1: PowerShell .ps1 파일로 COM 자동화
+        # -Command 인라인 방식은 따옴표 이스케이프 문제로 불안정 →
+        # .ps1 파일에 저장 후 -File 로 실행하는 방식이 안정적
+        ps_file = os.path.join(temp_dir, "convert.ps1")
+        ps_content = f"""$ErrorActionPreference = 'Stop'
+
+$ppt = $null
+$createdNew = $false
+try {{
+    $ppt = [Runtime.InteropServices.Marshal]::GetActiveObject('PowerPoint.Application')
+}} catch {{
+    $ppt = New-Object -ComObject PowerPoint.Application
+    $createdNew = $true
+}}
+
+$ppt.Visible = $true
+try {{
+    $prs = $ppt.Presentations.Open('{temp_pptx}', $true, $false, $false)
+    # ppSaveAsPDF = 32  (ExportAsFixedFormat 보다 버전 호환성 높음)
+    $prs.SaveAs('{temp_pdf}', 32)
+    $prs.Close()
+}} finally {{
+    if ($createdNew) {{ $ppt.Quit() }}
+}}
+"""
+        # UTF-8 BOM 포함 저장 (PowerShell이 한글 경로 읽을 때 필요)
+        with open(ps_file, "w", encoding="utf-8-sig") as f:
+            f.write(ps_content)
 
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File", ps_file],
             capture_output=True, text=True, timeout=300,
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
