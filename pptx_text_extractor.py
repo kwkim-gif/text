@@ -6,10 +6,11 @@
 
 import os
 import sys
+import queue
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -316,6 +317,7 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         self._last_output_folder = ""
         self._is_running = False
+        self._queue = queue.Queue()   # 스레드 → 메인 스레드 통신용
 
         self._build_ui()
         self._center_window()
@@ -563,11 +565,9 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         if not items or self._is_running:
             return
 
-        # 완료/오류 항목은 재시도, 대기 중인 항목만 처리
         targets = [i for i, it in enumerate(items)
                    if it.status in (ST_WAITING, ST_ERROR)]
         if not targets:
-            # 모두 완료됐다면 전체 재실행
             for item in items:
                 item.status = ST_WAITING
                 item.slides = ""
@@ -576,6 +576,14 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self._file_list.refresh()
 
         self._is_running = True
+
+        # Queue 초기화 (이전 잔여 메시지 제거)
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
         self._btn_run.configure(state="disabled", text="  추출 중...  ")
         self._btn_add.configure(state="disabled")
         self._btn_remove.configure(state="disabled")
@@ -588,58 +596,88 @@ class PPTXExtractorApp(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             target=self._run_all_thread, args=(targets,), daemon=True)
         thread.start()
 
-    # ── 메인 스레드 전용 UI 업데이트 헬퍼 (after()에서 직접 호출) ──────
-    # after(ms, func, arg1, arg2, ...) 형식만 안전 → 람다/kwargs 금지
+        # Queue 폴링 시작 (메인 스레드에서 50ms마다 메시지 처리)
+        self.after(50, self._poll_queue)
 
-    def _ui_set_running(self, idx, job_num, total_files, name):
-        self._file_list.update_item(idx, status=ST_RUNNING, message="")
-        self._lbl_status.configure(
-            text=f"[{job_num}/{total_files}]  {name}", fg=COLOR_ACCENT)
+    # ── Queue 폴링: 스레드 메시지를 메인 스레드에서 안전하게 처리 ──────────
+    # 스레드는 절대 after()를 호출하지 않고, Queue에만 메시지를 넣는다.
+    # 메인 스레드의 _poll_queue()가 꺼내서 UI를 업데이트한다.
 
-    def _ui_set_done(self, idx, total_slides, out_path):
-        self._file_list.update_item(
-            idx, status=ST_DONE, slides=str(total_slides),
-            message="저장 완료", output=out_path)
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                kind = msg[0]
 
-    def _ui_set_error(self, idx, msg):
-        self._file_list.update_item(idx, status=ST_ERROR, message=msg)
+                if kind == "running":
+                    _, idx, job_num, total_files, name = msg
+                    self._file_list.update_item(idx, status=ST_RUNNING, message="")
+                    self._lbl_status.configure(
+                        text=f"[{job_num}/{total_files}]  {name}", fg=COLOR_ACCENT)
 
-    def _ui_progress(self, pct, cur_slide, total_slides, job_num, total_files):
-        self._progressbar["value"] = pct
-        self._lbl_progress_text.configure(
-            text=f"파일 {job_num}/{total_files}  |  Slide {cur_slide}/{total_slides}  ({pct}%)")
+                elif kind == "progress":
+                    _, pct, cur, total_slides, jn, tf = msg
+                    self._progressbar["value"] = pct
+                    self._lbl_progress_text.configure(
+                        text=f"파일 {jn}/{tf}  |  Slide {cur}/{total_slides}  ({pct}%)")
 
-    # ── 백그라운드 추출 스레드 ────────────────────────────────────────
+                elif kind == "done":
+                    _, idx, total_slides, out_path = msg
+                    self._last_output_folder = os.path.dirname(out_path)
+                    self._file_list.update_item(
+                        idx, status=ST_DONE,
+                        slides=str(total_slides),
+                        message="저장 완료",
+                        output=out_path)
+
+                elif kind == "error":
+                    _, idx, err_msg = msg
+                    self._file_list.update_item(
+                        idx, status=ST_ERROR, message=err_msg)
+
+                elif kind == "all_done":
+                    _, total_files = msg
+                    self._on_all_done(total_files)
+                    return  # 완료 → 폴링 중단
+
+        except queue.Empty:
+            pass
+
+        # 아직 실행 중이면 계속 폴링
+        if self._is_running:
+            self.after(50, self._poll_queue)
+
+    # ── 백그라운드 추출 스레드 (Queue에만 메시지 전송, UI 직접 접근 금지) ──
 
     def _run_all_thread(self, target_indices):
         items = self._file_list.items
         total_files = len(target_indices)
 
-        for job_num, idx in enumerate(target_indices, start=1):
-            item = items[idx]
+        try:
+            for job_num, idx in enumerate(target_indices, start=1):
+                item = items[idx]
+                self._queue.put(("running", idx, job_num, total_files, item.name))
 
-            self.after(0, self._ui_set_running, idx, job_num, total_files, item.name)
+                def make_progress_cb(jn, tf):
+                    def cb(cur, total_slides):
+                        pct = int(((jn - 1) + cur / total_slides) / tf * 100)
+                        self._queue.put(("progress", pct, cur, total_slides, jn, tf))
+                    return cb
 
-            def make_progress_cb(jn, tf):
-                def cb(cur, total_slides):
-                    pct = int(((jn - 1) + cur / total_slides) / tf * 100)
-                    self.after(0, self._ui_progress, pct, cur, total_slides, jn, tf)
-                return cb
+                try:
+                    out, total_slides, empty = extract_pptx_to_txt(
+                        item.path,
+                        progress_callback=make_progress_cb(job_num, total_files),
+                    )
+                    self._queue.put(("done", idx, total_slides, out))
+                except Exception as e:
+                    self._queue.put(("error", idx, str(e)[:60]))
 
-            try:
-                out, total_slides, empty = extract_pptx_to_txt(
-                    item.path,
-                    progress_callback=make_progress_cb(job_num, total_files),
-                )
-                self._last_output_folder = os.path.dirname(out)
-                self.after(0, self._ui_set_done, idx, total_slides, out)
-            except Exception as e:
-                self.after(0, self._ui_set_error, idx, str(e)[:50])
+        except Exception as e:
+            # 예기치 않은 스레드 전체 오류도 Queue로 전달
+            self._queue.put(("error", 0, f"Thread error: {e}"))
 
-        self.after(0, self._on_all_done, total_files)
-
-    def _update_progress(self, pct, cur_slide, total_slides, job_num, total_files):
-        self._ui_progress(pct, cur_slide, total_slides, job_num, total_files)
+        self._queue.put(("all_done", total_files))
 
     def _on_all_done(self, total_files):
         self._is_running = False
