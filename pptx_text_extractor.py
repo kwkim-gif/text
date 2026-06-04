@@ -193,7 +193,7 @@ try {{
             detail = (result.stderr or result.stdout or "no output").strip()
             raise Exception(detail[:120])
 
-        # ── Step 2: PDF 페이지 → 이미지 (텍스트 레이어 제거)
+        # ── Step 2: PDF 페이지 → 이미지 (텍스트 레이어 제거, 무손실 PNG)
         zoom  = dpi / 72
         doc   = fitz.open(temp_pdf)
         total = len(doc)
@@ -203,7 +203,7 @@ try {{
             if progress_callback:
                 progress_callback(i + 1, total)
             pix      = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            img_file = os.path.join(temp_dir, f"slide_{i+1:04d}.jpg")
+            img_file = os.path.join(temp_dir, f"slide_{i+1:04d}.png")
             pix.save(img_file)
             img_paths.append(img_file)
         doc.close()
