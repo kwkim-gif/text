@@ -136,58 +136,53 @@ def _make_ascii_tempdir():
 
 def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
     """
-    win32com 으로 PowerPoint 를 제어해 슬라이드를 PNG 로 내보낸 뒤
-    Pillow 로 PDF 로 병합.  실행 PC 에 PowerPoint 가 설치되어야 함.
+    PowerShell COM 으로 PPTX → 중간 PDF → 이미지 → 이미지 전용 PDF.
+
+    win32com 은 PyInstaller --onefile 환경에서 CoInitialize/등록 문제로
+    불안정. Windows 내장 PowerShell 로 COM 을 대신 호출해 우회.
     """
-    import win32com.client
-    from PIL import Image
+    import fitz
+    from PIL import Image as PILImage
 
     base     = os.path.splitext(os.path.basename(pptx_path))[0]
     out_path = os.path.join(os.path.dirname(pptx_path), f"{base}_보안변환.pdf")
 
-    # ASCII 경로 임시 폴더 (COM 경로 오류 방지)
     temp_dir  = _make_ascii_tempdir()
     temp_pptx = os.path.join(temp_dir, "input.pptx")
     temp_pdf  = os.path.join(temp_dir, "intermediate.pdf")
     shutil.copy2(pptx_path, temp_pptx)
 
-    ppt_app     = None
-    created_new = False
-    prs         = None
-
     try:
-        # 기존 PowerPoint 인스턴스 재사용 (없으면 새로 생성)
-        try:
-            ppt_app = win32com.client.GetActiveObject("PowerPoint.Application")
-        except Exception:
-            ppt_app     = win32com.client.Dispatch("PowerPoint.Application")
-            created_new = True
+        # ── Step 1: PowerShell 로 COM 자동화 (기존 PPT 창 보호 포함)
+        ps_script = (
+            "$ErrorActionPreference='Stop';"
+            "$ppt=$null; $new=$false;"
+            "try{$ppt=[Runtime.InteropServices.Marshal]::GetActiveObject('PowerPoint.Application')}catch{$ppt=New-Object -ComObject PowerPoint.Application;$new=$true};"
+            "$ppt.Visible=$true;"
+            "try{"
+            f"  $prs=$ppt.Presentations.Open('{temp_pptx}',$true,$false,$true);"
+            "  try{$prs.Windows(1).WindowState=2}catch{};"
+            f"  $prs.ExportAsFixedFormat('{temp_pdf}',2);"
+            "  $prs.Close()"
+            "}finally{"
+            "  if($new){$ppt.Quit()}"
+            "}"
+        )
 
-        ppt_app.Visible = True
-        try:
-            ppt_app.WindowState = 2   # 앱 창 최소화
-        except Exception:
-            pass
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=300,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
 
-        prs = ppt_app.Presentations.Open(
-            temp_pptx, ReadOnly=True, Untitled=False, WithWindow=True)
-        try:
-            prs.Windows(1).WindowState = 2   # 프레젠테이션 창도 최소화
-        except Exception:
-            pass
+        if result.returncode != 0 or not os.path.exists(temp_pdf):
+            detail = (result.stderr or result.stdout or "no output").strip()
+            raise Exception(detail[:120])
 
-        # ── Step 1: PPT → 중간 PDF (ExportAsFixedFormat 은 Slide.Export 보다 안정적)
-        # 2 = ppFixedFormatTypePDF
-        prs.ExportAsFixedFormat(temp_pdf, 2)
-        total = prs.Slides.Count
-
-        prs.Close()
-        prs = None
-
-        # ── Step 2: PDF 페이지 → 이미지 (PyMuPDF, 텍스트 레이어 제거 효과)
-        import fitz   # PyMuPDF
-        zoom      = dpi / 72   # PyMuPDF 기본 해상도는 72 DPI
-        doc       = fitz.open(temp_pdf)
+        # ── Step 2: PDF 페이지 → 이미지 (텍스트 레이어 제거)
+        zoom  = dpi / 72
+        doc   = fitz.open(temp_pdf)
+        total = len(doc)
         img_paths = []
 
         for i, page in enumerate(doc):
@@ -199,29 +194,16 @@ def convert_pptx_to_pdf(pptx_path, dpi, progress_callback=None):
             img_paths.append(img_file)
         doc.close()
 
-        # ── Step 3: 이미지 → 이미지 전용 PDF (텍스트 선택 불가)
-        from PIL import Image as PILImage
+        # ── Step 3: 이미지 → 이미지 전용 PDF
         images = [PILImage.open(p).convert("RGB") for p in img_paths]
         if images:
             images[0].save(
                 out_path, save_all=True,
-                append_images=images[1:],
-                resolution=dpi,
-            )
+                append_images=images[1:], resolution=dpi)
         for img in images:
             img.close()
 
     finally:
-        try:
-            if prs is not None:
-                prs.Close()
-        except Exception:
-            pass
-        try:
-            if created_new and ppt_app:
-                ppt_app.Quit()
-        except Exception:
-            pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return out_path, total
@@ -801,9 +783,6 @@ class PDFConvertTab(BaseTabFrame):
         self._start_run(self._thread, targets)
 
     def _thread(self, target_indices):
-        # COM 은 스레드별로 초기화 필요 (메인 스레드와 별개)
-        import pythoncom
-        pythoncom.CoInitialize()
         items       = self._file_list.items
         total_files = len(target_indices)
         dpi         = self._dpi_var.get()
@@ -827,9 +806,6 @@ class PDFConvertTab(BaseTabFrame):
                     self._queue.put(("error", idx, str(e)[:60]))
         except Exception as e:
             self._queue.put(("error", 0, f"Thread error: {e}"))
-        finally:
-            import pythoncom
-            pythoncom.CoUninitialize()
         self._queue.put(("all_done", total_files))
 
 
