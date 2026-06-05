@@ -444,7 +444,7 @@ class BaseTabFrame(tk.Frame):
 
     def _build_drop_zone(self, parent, hint_text):
         outer = tk.Frame(parent, bg=COLOR_BORDER)
-        outer.pack(fill="x", pady=(0, 10))
+        outer.pack(side="top", fill="x", pady=(0, 10))
         inner = tk.Frame(outer, bg=COLOR_DROPZONE)
         inner.pack(fill="x", padx=1, pady=1)
         self._drop_zone = tk.Frame(inner, bg=COLOR_DROPZONE, pady=16)
@@ -474,7 +474,7 @@ class BaseTabFrame(tk.Frame):
 
     def _build_file_list_area(self, parent):
         outer = tk.Frame(parent, bg=COLOR_BORDER)
-        outer.pack(fill="both", expand=True, pady=(0, 10))
+        outer.pack(side="top", fill="both", expand=True, pady=(0, 10))
         inner = tk.Frame(outer, bg=COLOR_CARD)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
 
@@ -510,7 +510,7 @@ class BaseTabFrame(tk.Frame):
 
     def _build_progress_area(self, parent):
         outer = tk.Frame(parent, bg=COLOR_BORDER)
-        outer.pack(fill="x", pady=(0, 10))
+        outer.pack(side="bottom", fill="x", pady=(10, 0))
         card = tk.Frame(outer, bg=COLOR_CARD, padx=14, pady=12)
         card.pack(fill="x", padx=1, pady=1)
 
@@ -536,7 +536,7 @@ class BaseTabFrame(tk.Frame):
 
     def _build_bottom_bar(self, parent, run_text, run_cmd):
         bar = tk.Frame(parent, bg=COLOR_BG)
-        bar.pack(fill="x", pady=(0, 16))
+        bar.pack(side="bottom", fill="x", pady=(0, 16))
 
         self._btn_open_folder = tk.Button(
             bar, text="📂  저장 폴더 열기",
@@ -749,10 +749,12 @@ class TextExtractTab(BaseTabFrame):
         body = tk.Frame(self, bg=COLOR_BG)
         body.pack(fill="both", expand=True, padx=20, pady=16)
 
+        # bottom → top 순으로 pack(side="bottom") 요소를 먼저 배치해야
+        # 창이 작아져도 하단 버튼이 항상 보임
+        self._build_bottom_bar(body, self._run_label, self._on_run)
+        self._build_progress_area(body)
         self._build_drop_zone(body, "여기에 PPTX 파일을 드래그 앤 드롭하세요")
         self._build_file_list_area(body)
-        self._build_progress_area(body)
-        self._build_bottom_bar(body, self._run_label, self._on_run)
 
     def _on_run(self):
         items = self._file_list.items
@@ -803,11 +805,11 @@ class PDFConvertTab(BaseTabFrame):
         body = tk.Frame(self, bg=COLOR_BG)
         body.pack(fill="both", expand=True, padx=20, pady=16)
 
+        self._build_bottom_bar(body, self._run_label, self._on_run)
+        self._build_progress_area(body)
         self._build_drop_zone(body, "여기에 PPTX 파일을 드래그 앤 드롭하세요")
         self._build_dpi_selector(body)
         self._build_file_list_area(body)
-        self._build_progress_area(body)
-        self._build_bottom_bar(body, self._run_label, self._on_run)
 
     def _build_dpi_selector(self, parent):
         card = self._card(parent, "이미지 해상도 (DPI) 선택")
