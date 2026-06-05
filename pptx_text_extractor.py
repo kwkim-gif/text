@@ -217,7 +217,8 @@ try {{
             if progress_callback:
                 progress_callback(i + 1, total)
             pix      = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            img_page = out_doc.new_page(width=pix.width, height=pix.height)
+            # 페이지 크기는 원본 포인트(pt) 단위 유지 — 픽셀 수로 지정하면 DPI만큼 커짐
+            img_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
             img_page.insert_image(img_page.rect, pixmap=pix)
 
         src_doc.close()
